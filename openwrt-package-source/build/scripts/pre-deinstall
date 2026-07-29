@@ -1,0 +1,62 @@
+#!/bin/sh
+# Runs on the router before the package files are removed.
+#
+# Everything 99-pigeonmesh added is undone here, so uninstalling leaves the
+# router exactly as it was found: no stray alias address, no dangling DNS
+# entry pointing at nothing, no firewall rules for a port nobody listens on.
+[ -n "$IPKG_INSTROOT" ] && exit 0
+
+PM_DOMAIN=$(uci -q get pigeonmesh.main.domain || echo pigeon.mesh)
+
+/etc/init.d/pigeonmesh stop >/dev/null 2>&1
+/etc/init.d/pigeonmesh disable >/dev/null 2>&1
+
+# ------------------------------------------------------------------ firewall
+# pigeonmesh_alias is the DNAT redirect behind the friendly URL; the rest are
+# plain accept rules.
+for r in pigeonmesh_peer pigeonmesh_disc pigeonmesh_http pigeonmesh_alias \
+         pigeonmesh_notls; do
+	uci -q delete "firewall.$r"
+done
+
+# Drop the alias network back out of whichever zone holds it.
+i=0
+while uci -q get "firewall.@zone[$i]" >/dev/null 2>&1; do
+	uci -q del_list "firewall.@zone[$i].network=pigeonmesh"
+	i=$((i + 1))
+done
+uci -q commit firewall
+
+# ------------------------------------------------------------------- network
+uci -q delete network.pigeonmesh
+uci -q commit network
+
+# ----------------------------------------------------------------------- dns
+uci -q delete dhcp.pigeonmesh
+for old in $(uci -q get dhcp.@dnsmasq[0].address 2>/dev/null); do
+	case "$old" in
+		/$PM_DOMAIN/*) uci -q del_list dhcp.@dnsmasq[0].address="$old" ;;
+	esac
+done
+# dhcp.@dnsmasq[0].local is a single option, not a list. Only touch it to undo
+# the one release that wrongly added to it -- writing a list there stops
+# dnsmasq from starting at all.
+case " $(uci -q get dhcp.@dnsmasq[0].local 2>/dev/null) " in
+	*" /$PM_DOMAIN/ "*)
+		uci -q delete dhcp.@dnsmasq[0].local
+		uci set dhcp.@dnsmasq[0].local='/lan/'
+		;;
+esac
+while uci -q get dhcp.@dnsmasq[0].rebind_domain 2>/dev/null | grep -q "$PM_DOMAIN"; do
+	uci -q del_list dhcp.@dnsmasq[0].rebind_domain="$PM_DOMAIN" || break
+done
+uci -q commit dhcp
+
+sed -i "/[[:space:]]$PM_DOMAIN\$/d" /etc/hosts 2>/dev/null
+
+# --------------------------------------------------------------------- apply
+for s in network firewall dnsmasq; do
+	[ -x "/etc/init.d/$s" ] && "/etc/init.d/$s" reload >/dev/null 2>&1
+done
+
+exit 0

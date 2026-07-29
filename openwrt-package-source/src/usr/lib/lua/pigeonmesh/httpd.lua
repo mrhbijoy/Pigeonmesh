@@ -46,6 +46,31 @@ local STATUS = {
 local Server = {}
 Server.__index = Server
 
+-- One listening socket. nixio.bind() creates, binds and listens in one call,
+-- which leaves no window to set SO_REUSEADDR *before* the bind -- and before
+-- is the only time it matters. Two things depend on it:
+--
+--   - Binding a specific address on port 80 while uhttpd already holds the
+--     wildcard 0.0.0.0:80. Linux allows that when both sockets set the
+--     option, and routes to the more specific socket. That is what lets
+--     http://pigeon.mesh/ answer on port 80 without touching uhttpd.
+--   - Restarting the daemon while a socket is still in TIME_WAIT.
+local function bind_listener(addr, port)
+    local s = nixio.socket("inet", "stream")
+    if not s then return nil, "socket() failed" end
+    s:setsockopt("socket", "reuseaddr", 1)
+    if not s:bind(addr, port) then
+        pcall(function() s:close() end)
+        return nil, string.format("bind %s:%d failed", addr, port)
+    end
+    s:setblocking(false)
+    s:listen(32)
+    return s
+end
+
+-- cfg.listen is a list of { addr = , port = }. The first entry is the
+-- primary and must bind; the rest are best-effort, so a busy alias port
+-- never stops the node from coming up.
 function M.new(cfg)
     local self = setmetatable({}, Server)
     self.docroot = cfg.docroot
@@ -59,14 +84,40 @@ function M.new(cfg)
     self.log = cfg.log or function() end
     self.hits = 0
 
-    local srv = nixio.bind(cfg.addr or "0.0.0.0", cfg.port, "inet", "stream")
-    if not srv then return nil, "bind failed" end
-    srv:setsockopt("socket", "reuseaddr", 1)
-    srv:setblocking(false)
-    srv:listen(32)
-    self.srv = srv
-    self.port = cfg.port
+    local want = cfg.listen
+    if not want or #want == 0 then
+        want = { { addr = cfg.addr or "0.0.0.0", port = cfg.port } }
+    end
+
+    self.srvs = {}        -- list of listening sockets
+    self.islisten = {}    -- socket -> true
+    self.bound = {}       -- "addr:port" -> true
+    for i, l in ipairs(want) do
+        local ok, err = self:add_listener(l.addr or "0.0.0.0", l.port)
+        if not ok then
+            if i == 1 then return nil, err end
+            self.log("WARN: %s -- will retry", err)
+        end
+    end
+
+    self.port = want[1].port
     return self
+end
+
+-- Bring up a listener, now or later. The alias address is created by netifd,
+-- which can still be working when the daemon starts and always is after a
+-- cold boot, so a failure here is normal and worth retrying rather than
+-- fatal. Safe to call repeatedly: a bound address is a no-op.
+function Server:add_listener(addr, port)
+    local key = addr .. ":" .. port
+    if self.bound[key] then return true end
+    local s, err = bind_listener(addr, port)
+    if not s then return false, err end
+    self.srvs[#self.srvs + 1] = s
+    self.islisten[s] = true
+    self.bound[key] = true
+    self.log("http listening on %s", key)
+    return true
 end
 
 -- ------------------------------------------------------------------
@@ -83,7 +134,9 @@ local function close_conn(self, fd, why)
 end
 
 function Server:pollfds(list)
-    list[#list + 1] = { fd = self.srv, events = nixio.poll_flags("in"), _http = "listen" }
+    for _, s in ipairs(self.srvs) do
+        list[#list + 1] = { fd = s, events = nixio.poll_flags("in"), _http = "listen" }
+    end
     for fd, c in pairs(self.conns) do
         local ev = nixio.poll_flags("in")
         if #c.out > 0 then ev = bit.bor(ev, nixio.poll_flags("out")) end
@@ -92,7 +145,7 @@ function Server:pollfds(list)
 end
 
 function Server:owns(fd)
-    return fd == self.srv or self.conns[fd] ~= nil
+    return self.islisten[fd] or self.conns[fd] ~= nil
 end
 
 -- ------------------------------------------------------------------
@@ -400,9 +453,9 @@ function Server:handle(fd, revents)
     local has_err = bit.band(revents, bit.bor(nixio.poll_flags("err"),
         nixio.poll_flags("hup"))) ~= 0
 
-    if fd == self.srv then
+    if self.islisten[fd] then
         if has_in then
-            local newfd, host = self.srv:accept()
+            local newfd, host = fd:accept()
             if newfd then
                 if self.nconns >= self.max_conns then
                     -- Shed the oldest non-SSE connection rather than refuse
@@ -472,7 +525,8 @@ end
 
 function Server:close()
     for fd in pairs(self.conns) do close_conn(self, fd, "shutdown") end
-    if self.srv then self.srv:close() end
+    for _, s in ipairs(self.srvs or {}) do pcall(function() s:close() end) end
+    self.srvs, self.islisten, self.bound = {}, {}, {}
 end
 
 return M

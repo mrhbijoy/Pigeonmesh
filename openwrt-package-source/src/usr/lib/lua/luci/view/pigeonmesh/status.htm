@@ -1,0 +1,77 @@
+<%#
+ Node health, read straight from the daemon's own API.
+
+ The port comes from UCI rather than a literal, so this page keeps working
+ after someone changes it under Settings.
+-%>
+<%
+local uci = luci.model.uci.cursor()
+local port = uci:get("pigeonmesh", "main", "http_port") or "3607"
+local domain = uci:get("pigeonmesh", "main", "domain") or "pigeon.mesh"
+local alias = uci:get("pigeonmesh", "main", "alias_ip") or ""
+%>
+<%+header%>
+<h2>PigeonMesh — Status</h2>
+<div id="pm-status" style="font-family:monospace;background:#0b1220;color:#f1f5f9;padding:1rem;border-radius:8px;min-height:200px">Loading…</div>
+<script>
+(function(){
+    var host = location.hostname;
+    if (host.indexOf(':') >= 0 && host.charAt(0) !== '[') host = '[' + host + ']';
+    var API = location.protocol + '//' + host + ':<%=port%>/api';
+    var ALIAS = '<%=alias%>';
+    var box = document.getElementById('pm-status');
+
+    function esc(s) {
+        return String(s == null ? '' : s).replace(/[&<>"]/g, function(c) {
+            return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c];
+        });
+    }
+
+    function draw(d) {
+        var h = '';
+        if (d.node) {
+            h += '<h3 style="color:#f59e0b">Node</h3><pre style="white-space:pre-wrap">';
+            h += '  node:    ' + esc(d.node.node);
+            h += '\n  name:    ' + esc(d.node.name);
+            h += '\n  uptime:  ' + esc(d.node.uptime) + 's';
+            h += '\n  app:     http://' + esc('<%=domain%>') + '/';
+            if (ALIAS) h += '  (' + esc(ALIAS) + ':80)';
+            h += '\n           ' + API.replace(/\/api$/, '/');
+            h += '</pre>';
+        }
+        if (d.store) {
+            h += '<h3 style="color:#f59e0b">Store</h3><pre>  records: ' + esc(d.store.records);
+            h += '\n  bytes:   ' + esc(d.store.bytes) + ' / ' + esc(d.store.max_bytes) + '</pre>';
+        }
+        if (d.peers && d.peers.length > 0) {
+            h += '<h3 style="color:#f59e0b">Peers (' + d.peers.length + ')</h3><pre>';
+            d.peers.forEach(function(p) {
+                h += '  ' + esc(p.node) + '  ' + esc(p.name) + '  ' +
+                     (p.direct ? 'direct' : esc(p.hops) + ' hops') + '\n';
+            });
+            h += '</pre>';
+        } else {
+            h += '<h3 style="color:#f59e0b">Peers</h3><pre>  none — this node is alone on the mesh</pre>';
+        }
+        if (d.counts) {
+            h += '<h3 style="color:#f59e0b">Records by kind</h3><pre>';
+            for (var k in d.counts) h += '  ' + esc(k) + ': ' + esc(d.counts[k]) + '\n';
+            h += '</pre>';
+        }
+        box.innerHTML = h;
+    }
+
+    function f() {
+        fetch(API + '/state')
+            .then(function(r) { return r.json(); })
+            .then(draw)
+            .catch(function() {
+                box.innerHTML = '<p style="color:#ef4444">Daemon unreachable at ' +
+                    esc(API) + '</p>';
+            });
+    }
+    f();
+    setInterval(f, 10000);
+})();
+</script>
+<%+footer%>

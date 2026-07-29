@@ -262,17 +262,41 @@ input[type=file] { padding: 10px; }
 
 /* ------------------------------------------------------------------ map */
 
-.map-wrap { position: relative; flex: 0 0 auto; height: 46%; min-height: 240px;
+/* The map gets the larger share now that there is something on it to read.
+   The list below stays tall enough for two or three places, which is what a
+   thumb reaches without scrolling. */
+.map-wrap { position: relative; flex: 1 1 auto; min-height: 260px;
             background: #0d1830; border-bottom: 1px solid var(--line); }
-#map-canvas { width: 100%; height: 100%; display: block; touch-action: none; }
+#map-canvas { width: 100%; height: 100%; display: block; touch-action: none;
+              cursor: grab; }
+#map-canvas:active { cursor: grabbing; }
 .map-tools { position: absolute; left: 10px; right: 10px; bottom: 10px;
              display: flex; gap: 8px; justify-content: space-between; }
+.map-tools .btn { background: rgba(11,18,32,.82); backdrop-filter: blur(2px); }
+.map-tools .btn-primary { background: var(--accent); }
+
+.map-zoom { position: absolute; right: 10px; top: 10px; display: flex;
+            flex-direction: column; gap: 6px; }
+.zbtn {
+  width: var(--tap); height: var(--tap); border-radius: 11px;
+  background: rgba(11,18,32,.82); border: 1px solid var(--line);
+  color: var(--fg); font: inherit; font-size: 1.3rem; font-weight: 600;
+  line-height: 1; cursor: pointer; display: grid; place-items: center;
+}
+.zbtn:active { transform: scale(.96); }
+
+.map-note { position: absolute; left: 50%; top: 10px; transform: translateX(-50%);
+            background: rgba(11,18,32,.86); border: 1px solid var(--line);
+            color: var(--fg-dim); font-size: 11.5px; padding: 5px 10px;
+            border-radius: 8px; max-width: 74%; text-align: center; }
+
 .map-legend { position: absolute; top: 8px; left: 8px; display: flex;
               flex-direction: column; gap: 3px; font-size: 11px;
               background: rgba(11,18,32,.78); padding: 6px 8px; border-radius: 8px; }
 .map-legend span { display: flex; align-items: center; gap: 5px; }
 .map-legend i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
-.map-list { max-height: 54%; }
+.map-list { flex: 0 0 auto; max-height: 34%; }
+.pin-row { cursor: pointer; }
 
 .pin-row { display: flex; align-items: center; gap: 10px; padding: 10px;
            background: var(--bg-2); border: 1px solid var(--line);

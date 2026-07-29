@@ -107,6 +107,16 @@ const I18N = {
     no_pins: 'কোনো জায়গা যুক্ত করা হয়নি',
     locating: 'অবস্থান খোঁজা হচ্ছে…',
     no_gps: 'অবস্থান পাওয়া যায়নি',
+    gps_insecure: 'এই ঠিকানায় ব্রাউজার অবস্থান দেয় না — মানচিত্রে চেপে জায়গা বেছে নিন',
+    zoom_in: 'কাছে',
+    zoom_out: 'দূরে',
+    save_area: 'এই এলাকা সেভ',
+    saving_area: 'মানচিত্র নামছে',
+    area_saved: 'এলাকা সেভ হয়েছে — ইন্টারনেট ছাড়াও দেখা যাবে',
+    area_failed: 'মানচিত্র নামানো যায়নি — ইন্টারনেট নেই',
+    map_sketch: 'মানচিত্রের ছবি নেই — দূরত্বের ছক দেখাচ্ছে',
+    map_saved_only: 'ইন্টারনেট নেই — সংরক্ষিত মানচিত্র',
+    selected_spot: 'বাছাই করা জায়গা',
 
     // mesh
     this_node: 'এই নোড',
@@ -149,6 +159,16 @@ const I18N = {
     ago_d: 'দিন আগে',
     install: 'অ্যাপ ইনস্টল করুন',
     optional: 'ঐচ্ছিক',
+    version: 'সংস্করণ',
+    unknown: 'অজানা',
+
+    // units. Written out rather than left as KB/km, because a screen that
+    // mixes two scripts mid-sentence is the thing people call unreadable.
+    unit_m: 'মি',
+    unit_km: 'কিমি',
+    unit_kb: 'কেবি',
+    unit_mb: 'এমবি',
+    unit_s: 'সেকেন্ড',
   },
 
   en: {
@@ -239,6 +259,16 @@ const I18N = {
     no_pins: 'No places added yet',
     locating: 'Finding your location…',
     no_gps: 'Location unavailable',
+    gps_insecure: 'The browser blocks location on this address — tap the map to pick a spot',
+    zoom_in: 'Closer',
+    zoom_out: 'Wider',
+    save_area: 'Save this area',
+    saving_area: 'Downloading map',
+    area_saved: 'Area saved — it will show without internet',
+    area_failed: 'Could not download the map — no internet',
+    map_sketch: 'No map imagery — showing a distance grid',
+    map_saved_only: 'No internet — showing the saved map',
+    selected_spot: 'Chosen spot',
 
     this_node: 'This node',
     nodes: 'Nodes',
@@ -278,6 +308,14 @@ const I18N = {
     ago_d: 'd ago',
     install: 'Install app',
     optional: 'optional',
+    version: 'Version',
+    unknown: 'unknown',
+
+    unit_m: 'm',
+    unit_km: 'km',
+    unit_kb: 'KB',
+    unit_mb: 'MB',
+    unit_s: 's',
   },
 };
 

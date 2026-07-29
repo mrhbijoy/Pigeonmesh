@@ -27,7 +27,8 @@ async function loadSeq(): Promise<number> {
 async function loadBytes(): Promise<number> {
   if (cachedBytes) return cachedBytes;
   const r = await db.record.aggregate({ _sum: { size: true } });
-  cachedBytes = r._sum.size || 0;
+  // _sum is null when there are no rows at all, not just when the sum is zero.
+  cachedBytes = r._sum?.size ?? 0;
   return cachedBytes;
 }
 
@@ -195,9 +196,18 @@ export async function stats() {
 }
 
 export async function countByKind(): Promise<Record<string, number>> {
-  const rows = await db.record.groupBy({ by: ["kind"], _count: true });
+  const rows = await db.record.groupBy({ by: ["kind"], _count: { _all: true } });
   const out: Record<string, number> = {};
-  for (const r of rows) out[r.kind] = r._count;
+  for (const r of rows) {
+    // Prisma types _count as a union of a bare number and a per-field object
+    // depending on how it was asked for; accept either rather than assert.
+    const c: unknown = r._count;
+    out[r.kind] = typeof c === "number"
+      ? c
+      : (c && typeof c === "object" && typeof (c as { _all?: unknown })._all === "number")
+        ? (c as { _all: number })._all
+        : 0;
+  }
   return out;
 }
 

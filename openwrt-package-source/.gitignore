@@ -1,11 +1,7 @@
-# Locally built apk-tools, used only to produce OpenWrt apk v3 packages.
-# Rebuild with build/get-apk-tools.sh rather than committing a binary.
-.tools/
-
-# Build output and staging.
+# Build output. build/build.sh writes packages to ../dist and stages in a
+# temporary directory outside the tree, so there is nothing else to ignore
+# here -- build/ itself is source.
 dist/
-.stage/
 
-# The feed Makefile expects a "files" symlink to ../src; it is created by the
-# build rather than committed, since Windows checkouts turn it into a junction.
-openwrt-feed/files
+# Locally built apk-tools, if you keep one here to get "apk mkpkg".
+.tools/

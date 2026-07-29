@@ -28,11 +28,18 @@ export const VALID_KINDS: RecordKind[] = [
 
 // Lower priority number = more important; 0 is SOS, never evicted under
 // storage pressure.
+//
+// These two tables must agree with store.lua on the router. "ack" was absent
+// from both here and there, which gave every "responding" / "resolved" /
+// "found" marker an undefined priority and an undefined lifetime. Keep the
+// Record<RecordKind, ...> annotations: they are what makes adding a kind
+// without filling these in a compile error rather than a NaN in the field.
 export const PRIORITY: Record<RecordKind, number> = {
   sos: 0,
   checkin: 1,
   missing: 1,
   bulletin: 1,
+  ack: 1,
   pin: 2,
   dm: 2,
   chat: 3,
@@ -45,6 +52,9 @@ export const DEFAULT_TTL: Record<RecordKind, number> = {
   checkin: 7 * 24 * 3600,
   missing: 30 * 24 * 3600,
   bulletin: 7 * 24 * 3600,
+  // Outlives the longest thing it can annotate, so a found person does not
+  // become missing again when the marker expires before the report.
+  ack: 30 * 24 * 3600,
   pin: 30 * 24 * 3600,
   dm: 30 * 24 * 3600,
   chat: 3 * 24 * 3600,

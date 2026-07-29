@@ -83,6 +83,10 @@ export async function topology() {
       battery: null,
       records: s.records,
       uptime: nodeInfo().uptime,
+      // This node, so zero hops away and seen right now. Omitting them left
+      // the bridge's own row in the topology with blank columns.
+      hops: 0,
+      last_seen: Math.floor(Date.now() / 1000),
       links: [],
     });
   }

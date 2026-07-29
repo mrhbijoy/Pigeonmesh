@@ -88,7 +88,7 @@ export function TopologyMap() {
         {/* edges */}
         {placed.map((p) => (
           <line
-            key={`e-${p.node.id}`}
+            key={`e-${p.node.node}`}
             x1={W / 2}
             y1={H / 2}
             x2={p.x}
@@ -100,7 +100,7 @@ export function TopologyMap() {
         ))}
         {/* nodes */}
         {placed.map((p) => (
-          <g key={`n-${p.node.id}`} transform={`translate(${p.x},${p.y})`}>
+          <g key={`n-${p.node.node}`} transform={`translate(${p.x},${p.y})`}>
             <circle
               r={p.node.self ? 8 : 5}
               fill={p.node.self ? "#f59e0b" : kindToColor(p.node)}

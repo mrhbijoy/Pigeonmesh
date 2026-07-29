@@ -44,8 +44,15 @@ local EV_HUP = nixio.poll_flags("hup")
 local CFG = {
     peer_port           = 7100,
     disc_port           = 7101,
-    http_port           = 8080,
+    http_port           = 3607,
     http_addr           = "0.0.0.0",
+    -- A second LAN address that belongs to PigeonMesh alone, so the app can
+    -- answer on port 80 there while uhttpd keeps port 80 on the router's own
+    -- address for LuCI. This is what makes http://pigeon.mesh/ work with no
+    -- port number and no redirect page. Empty disables the second listener.
+    alias_ip            = "",
+    alias_port          = 80,
+    alias_listen        = 0,
     docroot             = "/www/pigeonmesh",
     hot_path            = "/var/lib/pigeonmesh/records.jsonl",
     checkpoint_path     = "/etc/pigeonmesh/store/records.jsonl",
@@ -68,13 +75,16 @@ if u.enabled == "0" or u.enabled == "false" then
     io.stderr:write("[pigeonmeshd] disabled in /etc/config/pigeonmesh; exiting\n")
     os.exit(0)
 end
-for _, k in ipairs({ "peer_port", "disc_port", "http_port", "max_bytes",
-                     "max_records", "max_body", "max_hops", "beacon_interval",
-                     "gossip_interval", "peer_timeout", "checkpoint_interval",
-                     "post_rate", "post_burst", "log_level" }) do
+for _, k in ipairs({ "peer_port", "disc_port", "http_port", "alias_port",
+                     "alias_listen",
+                     "max_bytes", "max_records", "max_body", "max_hops",
+                     "beacon_interval", "gossip_interval", "peer_timeout",
+                     "checkpoint_interval", "post_rate", "post_burst",
+                     "log_level" }) do
     if u[k] then CFG[k] = tonumber(u[k]) or CFG[k] end
 end
-for _, k in ipairs({ "http_addr", "docroot", "hot_path", "checkpoint_path", "domain" }) do
+for _, k in ipairs({ "http_addr", "alias_ip", "docroot", "hot_path",
+                     "checkpoint_path", "domain" }) do
     if u[k] and #u[k] > 0 then CFG[k] = u[k] end
 end
 
@@ -438,22 +448,37 @@ local disc_tx = nixio.socket("inet", "dgram")
 disc_tx:setsockopt("socket", "broadcast", 1)
 disc_tx:setblocking(false)
 
-server = httpd.new({
-    addr = CFG.http_addr,
-    port = CFG.http_port,
+-- The memorial port is the primary and is always bound.
+--
+-- Port 80 on the alias address is normally reached by a firewall redirect set
+-- up in uci-defaults, not by a second listener: uhttpd holds the wildcard
+-- 0.0.0.0:80 and the kernel refuses a specific-address bind alongside it, so
+-- the only way to bind here directly is to restrict uhttpd's own listen
+-- addresses first. That is the admin's call to make, not this package's, so
+-- alias_listen is off unless someone has done it and turns this on.
+local listen = { { addr = CFG.http_addr, port = CFG.http_port } }
+if CFG.alias_listen == 1 and #CFG.alias_ip > 0 and CFG.alias_ip ~= CFG.http_addr then
+    listen[#listen + 1] = { addr = CFG.alias_ip, port = CFG.alias_port }
+end
+
+local http_err
+server, http_err = httpd.new({
+    listen = listen,
     docroot = CFG.docroot,
     max_body = CFG.max_body * 8,
     log = function(fmt, ...) logf(1, fmt, ...) end,
 })
 if not server then
-    logf(0, "FATAL: cannot bind HTTP %s:%d", CFG.http_addr, CFG.http_port)
+    logf(0, "FATAL: cannot bind HTTP %s:%d (%s)", CFG.http_addr, CFG.http_port,
+         tostring(http_err))
     os.exit(1)
 end
 ctx.server = server
 server.handler = api.make_handler(ctx)
 
-logf(0, "PigeonMesh %s up: node=%s name=%s peers=:%d disc=:%d http=:%d",
-     VERSION, NODE_ID, NODE_NAME, CFG.peer_port, CFG.disc_port, CFG.http_port)
+logf(0, "PigeonMesh %s up: node=%s name=%s peers=:%d disc=:%d http=:%d%s",
+     VERSION, NODE_ID, NODE_NAME, CFG.peer_port, CFG.disc_port, CFG.http_port,
+     #CFG.alias_ip > 0 and string.format(" alias=%s:%d", CFG.alias_ip, CFG.alias_port) or "")
 
 -- ------------------------------------------------------------------
 -- Discovery
@@ -661,6 +686,11 @@ while running do
     if now - last_maint >= 10 then
         last_maint = now
         server:tick(now)
+        -- netifd may still have been bringing the alias address up when we
+        -- started, and after a cold boot it always is. Keep asking.
+        if CFG.alias_listen == 1 and #CFG.alias_ip > 0 then
+            server:add_listener(CFG.alias_ip, CFG.alias_port)
+        end
         api.gc_buckets()
         local wall = util.now()
         for fd, c in pairs(conns) do

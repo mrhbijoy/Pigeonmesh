@@ -1,16 +1,84 @@
 #!/bin/sh
 # Runs once, on install and on first boot after a sysupgrade.
 #
-# Three jobs: let mesh traffic through the firewall on the LAN side only,
-# make pigeon.mesh resolve to this router, and leave a breadcrumb in LuCI.
+# Four jobs: let mesh traffic through the firewall on the LAN side only,
+# give PigeonMesh a LAN address of its own, make pigeon.mesh resolve to that
+# address, and undo the redirect hack older versions left in /www/index.html.
 # Everything here is idempotent and reversible.
+#
+# The address split is the whole trick behind "type pigeon.mesh and you get
+# the app, type the router's IP and you get LuCI". Both are port 80. uhttpd
+# holds the wildcard 0.0.0.0:80 and is not touched at all -- there is no way
+# for anything here to lock an admin out of LuCI. PigeonMesh binds port 80 on
+# its own address only, which Linux prefers over the wildcard socket for
+# traffic to that address.
 
 . /lib/functions.sh
 
 PM_PEER_PORT=$(uci -q get pigeonmesh.main.peer_port || echo 7100)
 PM_DISC_PORT=$(uci -q get pigeonmesh.main.disc_port || echo 7101)
 PM_HTTP_PORT=$(uci -q get pigeonmesh.main.http_port || echo 3607)
+PM_ALIAS_PORT=$(uci -q get pigeonmesh.main.alias_port || echo 80)
 PM_DOMAIN=$(uci -q get pigeonmesh.main.domain || echo pigeon.mesh)
+
+# ---------------------------------------------------------------- lan facts
+# On OpenWrt 25.x network.lan.ipaddr can carry a prefix ("192.168.3.1/24").
+# Feeding that to dnsmasq silently breaks name resolution, so strip it.
+LAN_IP=$(uci -q get network.lan.ipaddr | cut -d/ -f1)
+[ -z "$LAN_IP" ] && LAN_IP=$(ip -4 -o addr show br-lan 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+LAN_MASK=$(uci -q get network.lan.netmask)
+[ -z "$LAN_MASK" ] && LAN_MASK=255.255.255.0
+
+# ------------------------------------------------------------- alias address
+# Pick a host in the LAN subnet that DHCP will not hand out. The default pool
+# is .100 to .249, so .254 is free on a stock router; step down if the router
+# itself already sits there.
+pm_alias_ip() {
+	local base last
+	base=$(echo "$LAN_IP" | cut -d. -f1-3)
+	last=$(echo "$LAN_IP" | cut -d. -f4)
+	[ -z "$base" ] && return 1
+	if [ "$last" = "254" ]; then echo "$base.253"; else echo "$base.254"; fi
+}
+
+PM_ALIAS_IP=""
+if [ -n "$LAN_IP" ]; then
+	PM_ALIAS_IP=$(pm_alias_ip)
+fi
+
+if [ -n "$PM_ALIAS_IP" ]; then
+	# A separate interface section rather than a second address on lan: it is
+	# self-contained, so removing the package removes the address and nothing
+	# about the LAN interface was ever edited.
+	uci -q delete network.pigeonmesh
+	uci set network.pigeonmesh=interface
+	uci set network.pigeonmesh.proto='static'
+	uci set network.pigeonmesh.device='br-lan'
+	uci set network.pigeonmesh.ipaddr="$PM_ALIAS_IP"
+	uci set network.pigeonmesh.netmask="$LAN_MASK"
+	uci commit network
+
+	uci set pigeonmesh.main.alias_ip="$PM_ALIAS_IP"
+	uci commit pigeonmesh
+
+	# A network that belongs to no firewall zone falls through to the INPUT
+	# policy, which rejects. Put it in the same zone as lan so the app is
+	# reachable from the LAN and from nowhere else.
+	pm_add_zone() {
+		local cfg="$1" name
+		config_get name "$cfg" name
+		[ "$name" = "lan" ] || return 0
+		local nets
+		config_get nets "$cfg" network
+		case " $nets " in
+			*" pigeonmesh "*) ;;
+			*) uci add_list firewall.$cfg.network='pigeonmesh' ;;
+		esac
+	}
+	config_load firewall
+	config_foreach pm_add_zone zone
+	uci commit firewall
+fi
 
 # ---------------------------------------------------------------- firewall
 # The mesh is a LAN-side service. Nothing here opens a port to the WAN: a
@@ -29,68 +97,121 @@ add_rule() {
 add_rule pigeonmesh_peer tcp "$PM_PEER_PORT" "PigeonMesh mesh link"
 add_rule pigeonmesh_disc udp "$PM_DISC_PORT" "PigeonMesh discovery"
 add_rule pigeonmesh_http tcp "$PM_HTTP_PORT" "PigeonMesh app"
+
+# ------------------------------------------------------- the friendly URL
+# Port 80 on the alias address is delivered to the app by rewriting the port,
+# not by listening there. uhttpd holds the wildcard 0.0.0.0:80 and the kernel
+# refuses a second bind for a specific address on the same port, so the only
+# way to listen directly would be to narrow uhttpd's own listen addresses --
+# and an admin who later changes the LAN address would lose LuCI. A redirect
+# costs one nat rule and cannot lock anybody out of anything.
+#
+# Only traffic addressed to PigeonMesh's own address is touched. The router's
+# address on port 80 is not matched, so LuCI is unaffected.
+uci -q delete firewall.pigeonmesh_alias
+uci -q delete firewall.pigeonmesh_notls
+if [ -n "$PM_ALIAS_IP" ]; then
+	uci set firewall.pigeonmesh_alias=redirect
+	uci set firewall.pigeonmesh_alias.name='PigeonMesh friendly URL'
+	uci set firewall.pigeonmesh_alias.target='DNAT'
+	uci set firewall.pigeonmesh_alias.src='lan'
+	uci set firewall.pigeonmesh_alias.proto='tcp'
+	uci set firewall.pigeonmesh_alias.src_dip="$PM_ALIAS_IP"
+	uci set firewall.pigeonmesh_alias.src_dport="$PM_ALIAS_PORT"
+	uci set firewall.pigeonmesh_alias.dest_port="$PM_HTTP_PORT"
+
+	# Refuse TLS on this address, and refuse it fast.
+	#
+	# uhttpd's wildcard bind means it also answers :443 here, with a
+	# self-signed certificate issued for the router -- not for this name. A
+	# phone browser that tries HTTPS first (Chrome does, for a typed
+	# hostname) then gets a *successful* connection with a bad certificate,
+	# shows an interstitial or a blank page, and never falls back to HTTP.
+	# The app has no TLS to offer, so a clean REJECT is the honest answer: the
+	# HTTPS attempt fails immediately and the browser retries over HTTP.
+	#
+	# Scoped to this address only. LuCI keeps HTTPS on the router's own
+	# address exactly as before.
+	uci set firewall.pigeonmesh_notls=rule
+	uci set firewall.pigeonmesh_notls.name='PigeonMesh: no TLS on the app address'
+	uci set firewall.pigeonmesh_notls.src='lan'
+	uci set firewall.pigeonmesh_notls.proto='tcp'
+	uci set firewall.pigeonmesh_notls.dest_ip="$PM_ALIAS_IP"
+	uci set firewall.pigeonmesh_notls.dest_port='443'
+	uci set firewall.pigeonmesh_notls.target='REJECT'
+fi
 uci commit firewall
 
-# ---------------------------------------------------------------- dns & index redirect
+# ---------------------------------------------------------------------- dns
 # Give the app a name people can type from memory and read off a wall.
-# On OpenWrt 25.x network.lan.ipaddr can carry a prefix ("192.168.3.1/24").
-# Feeding that to dnsmasq silently breaks name resolution, so strip it.
-LAN_IP=$(uci -q get network.lan.ipaddr | cut -d/ -f1)
-[ -z "$LAN_IP" ] && LAN_IP=$(ip -4 -o addr show br-lan 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+#
+# Only an A record is published. The alias is IPv4, and an AAAA pointing at
+# the router's own IPv6 address would send half of all phones to LuCI instead
+# of the app -- worse than no AAAA at all, which browsers handle by falling
+# back to IPv4. "address=" is already authoritative: dnsmasq answers the name
+# from it and never forwards it upstream.
+#
+# Nothing here writes dhcp.@dnsmasq[0].local. OpenWrt renders that as a single
+# option, so adding a second value produces "local=/lan/ /pigeon.mesh/" on one
+# line, which dnsmasq rejects outright -- and a dnsmasq that will not start is
+# a router with no DNS and no DHCP for anybody.
+PM_DNS_IP="${PM_ALIAS_IP:-$LAN_IP}"
 
-if [ -n "$LAN_IP" ]; then
-	uci del_list dhcp.@dnsmasq[0].address="/$PM_DOMAIN/$LAN_IP" 2>/dev/null
-	uci add_list dhcp.@dnsmasq[0].address="/$PM_DOMAIN/$LAN_IP"
-	uci del_list dhcp.@dnsmasq[0].rebind_domain="$PM_DOMAIN" 2>/dev/null
+if [ -n "$PM_DNS_IP" ]; then
+	# Drop every earlier form this package has used, including the duplicates
+	# older revisions accumulated, before writing the current one.
+	uci -q delete dhcp.pigeonmesh
+	for old in $(uci -q get dhcp.@dnsmasq[0].address); do
+		case "$old" in
+			/$PM_DOMAIN/*) uci -q del_list dhcp.@dnsmasq[0].address="$old" ;;
+		esac
+	done
+	while uci -q get dhcp.@dnsmasq[0].rebind_domain | grep -q "$PM_DOMAIN"; do
+		uci -q del_list dhcp.@dnsmasq[0].rebind_domain="$PM_DOMAIN" || break
+	done
+
+	# Repair a router already left in the broken state described above.
+	case " $(uci -q get dhcp.@dnsmasq[0].local) " in
+		*" /$PM_DOMAIN/ "*)
+			uci -q delete dhcp.@dnsmasq[0].local
+			uci set dhcp.@dnsmasq[0].local='/lan/'
+			;;
+	esac
+
+	uci add_list dhcp.@dnsmasq[0].address="/$PM_DOMAIN/$PM_DNS_IP"
 	uci add_list dhcp.@dnsmasq[0].rebind_domain="$PM_DOMAIN"
 	uci commit dhcp
 
-	if ! grep -q "$PM_DOMAIN" /etc/hosts; then
-		echo "$LAN_IP $PM_DOMAIN" >> /etc/hosts
-	fi
+	# The router resolves the name for itself too, so the CLI and the LuCI
+	# pages can reach the app by name.
+	sed -i "/[[:space:]]$PM_DOMAIN\$/d" /etc/hosts 2>/dev/null
+	echo "$PM_DNS_IP $PM_DOMAIN" >> /etc/hosts
 fi
 
-# Set up uhttpd /www/index.html with host header redirection:
-# pigeon.mesh -> :3607, IP / others -> /cgi-bin/luci
-cat > /www/index.html <<'INDEXEOF'
-<!DOCTYPE html>
+# ------------------------------------------------------- undo the old hack
+# Revisions up to 1.0.0-r1 overwrote /www/index.html with a script that
+# sniffed the Host header and bounced pigeon.mesh to :3607. The alias makes
+# that unnecessary, and leaving it behind would break LuCI for anyone who
+# reaches the router by a name rather than by IP. Put back what LuCI ships.
+if [ -f /www/index.html ] && grep -q "$PM_DOMAIN" /www/index.html 2>/dev/null; then
+	cat > /www/index.html <<'INDEXEOF'
 <html>
-<head>
-<meta charset="utf-8">
-<title>OpenWrt / PigeonMesh</title>
-<script>
-(function() {
-  var h = window.location.hostname;
-  if (h === 'pigeon.mesh' || h.indexOf('pigeon.mesh') !== -1) {
-    window.location.replace(window.location.protocol + '//' + h + ':3607' + window.location.pathname + window.location.search + window.location.hash);
-  } else {
-    window.location.replace('/cgi-bin/luci');
-  }
-})();
-</script>
-</head>
-<body>
-Redirecting...
-</body>
+<head><meta http-equiv="refresh" content="0; url=/cgi-bin/luci/"></head>
+<body><a href="/cgi-bin/luci/">LuCI - Lua Configuration Interface</a></body>
 </html>
 INDEXEOF
-
-# Ensure uhttpd serves index.html by default
-if uci -q get uhttpd.main >/dev/null; then
-	uci set uhttpd.main.index_page='index.html'
-	uci commit uhttpd
 fi
 
 # ---------------------------------------------------------------- apply
 # uci-defaults also runs during image build, where no services exist yet.
+if [ -d /var/run ] && [ -x /etc/init.d/network ] && [ -n "$PM_ALIAS_IP" ]; then
+	/etc/init.d/network reload >/dev/null 2>&1
+fi
 if [ -d /var/run ] && [ -x /etc/init.d/firewall ]; then
 	/etc/init.d/firewall reload >/dev/null 2>&1
 fi
 if [ -d /var/run ] && [ -x /etc/init.d/dnsmasq ]; then
 	/etc/init.d/dnsmasq reload >/dev/null 2>&1
-fi
-if [ -d /var/run ] && [ -x /etc/init.d/uhttpd ]; then
-	/etc/init.d/uhttpd reload >/dev/null 2>&1
 fi
 
 exit 0

@@ -6,15 +6,15 @@
 # signed with the buildroot's key, and baked into a firmware image.
 #
 # Usage:
-#   echo "src-link pigeonmesh /path/to/pigeonmesh/openwrt-feed" >> feeds.conf
+#   echo "src-link pigeonmesh /path/to/pigeonmesh/openwrt-package-source/openwrt-feed" >> feeds.conf
 #   ./scripts/feeds update pigeonmesh && ./scripts/feeds install pigeonmesh
-#   make menuconfig     # Network -> pigeonmesh
+#   make menuconfig     # Network -> Communication -> pigeonmesh
 #   make package/pigeonmesh/compile
 
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=pigeonmesh
-PKG_VERSION:=1.0.0
+PKG_VERSION:=1.1.0
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=PigeonMesh contributors
@@ -24,6 +24,14 @@ PKG_LICENSE:=GPL-2.0-only
 PKG_ARCH:=all
 PKG_BUILD_DEPENDS:=
 PKG_BUILD_PARALLEL:=1
+
+# feeds installs this package as a symlink, so the payload has to be found
+# relative to where this Makefile really lives, not where make was handed it.
+# GNU make's $(realpath) resolves the symlink; $(abspath) would not.
+PM_SELF:=$(realpath $(lastword $(MAKEFILE_LIST)))
+PM_ROOT:=$(realpath $(dir $(PM_SELF))../..)
+PM_SRC:=$(PM_ROOT)/src
+PM_SCRIPTS:=$(PM_ROOT)/build/scripts
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -67,53 +75,46 @@ endef
 
 define Package/pigeonmesh/install
 	$(INSTALL_DIR) $(1)/usr/sbin
-	$(INSTALL_BIN) ./files/usr/sbin/pigeonmeshd $(1)/usr/sbin/
+	$(INSTALL_BIN) $(PM_SRC)/usr/sbin/pigeonmeshd $(1)/usr/sbin/
 
 	$(INSTALL_DIR) $(1)/usr/bin
-	$(INSTALL_BIN) ./files/usr/bin/pigeonmesh $(1)/usr/bin/
+	$(INSTALL_BIN) $(PM_SRC)/usr/bin/pigeonmesh $(1)/usr/bin/
 
 	$(INSTALL_DIR) $(1)/usr/lib/lua/pigeonmesh
-	$(INSTALL_DATA) ./files/usr/lib/lua/pigeonmesh/*.lua $(1)/usr/lib/lua/pigeonmesh/
+	$(INSTALL_DATA) $(PM_SRC)/usr/lib/lua/pigeonmesh/*.lua $(1)/usr/lib/lua/pigeonmesh/
+
+	# LuCI pages. Inert when LuCI is not installed, so they are not a
+	# reason to pull the whole web interface onto a headless node.
+	$(INSTALL_DIR) $(1)/usr/lib/lua/luci/controller
+	$(INSTALL_DATA) $(PM_SRC)/usr/lib/lua/luci/controller/pigeonmesh.lua \
+		$(1)/usr/lib/lua/luci/controller/
+	$(INSTALL_DIR) $(1)/usr/lib/lua/luci/model/cbi/pigeonmesh
+	$(INSTALL_DATA) $(PM_SRC)/usr/lib/lua/luci/model/cbi/pigeonmesh/*.lua \
+		$(1)/usr/lib/lua/luci/model/cbi/pigeonmesh/
+	$(INSTALL_DIR) $(1)/usr/lib/lua/luci/view/pigeonmesh
+	$(INSTALL_DATA) $(PM_SRC)/usr/lib/lua/luci/view/pigeonmesh/*.htm \
+		$(1)/usr/lib/lua/luci/view/pigeonmesh/
 
 	$(INSTALL_DIR) $(1)/www/pigeonmesh/icons
-	$(INSTALL_DATA) ./files/www/pigeonmesh/*.html $(1)/www/pigeonmesh/
-	$(INSTALL_DATA) ./files/www/pigeonmesh/*.js $(1)/www/pigeonmesh/
-	$(INSTALL_DATA) ./files/www/pigeonmesh/*.css $(1)/www/pigeonmesh/
-	$(INSTALL_DATA) ./files/www/pigeonmesh/*.webmanifest $(1)/www/pigeonmesh/
-	$(INSTALL_DATA) ./files/www/pigeonmesh/icons/* $(1)/www/pigeonmesh/icons/
+	$(INSTALL_DATA) $(PM_SRC)/www/pigeonmesh/index.html $(1)/www/pigeonmesh/
+	$(INSTALL_DATA) $(PM_SRC)/www/pigeonmesh/*.js $(1)/www/pigeonmesh/
+	$(INSTALL_DATA) $(PM_SRC)/www/pigeonmesh/*.css $(1)/www/pigeonmesh/
+	$(INSTALL_DATA) $(PM_SRC)/www/pigeonmesh/*.webmanifest $(1)/www/pigeonmesh/
+	$(INSTALL_DATA) $(PM_SRC)/www/pigeonmesh/icons/* $(1)/www/pigeonmesh/icons/
 
 	$(INSTALL_DIR) $(1)/etc/config
-	$(INSTALL_CONF) ./files/etc/config/pigeonmesh $(1)/etc/config/pigeonmesh
+	$(INSTALL_CONF) $(PM_SRC)/etc/config/pigeonmesh $(1)/etc/config/pigeonmesh
 
 	$(INSTALL_DIR) $(1)/etc/init.d
-	$(INSTALL_BIN) ./files/etc/init.d/pigeonmesh $(1)/etc/init.d/pigeonmesh
+	$(INSTALL_BIN) $(PM_SRC)/etc/init.d/pigeonmesh $(1)/etc/init.d/pigeonmesh
 
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
-	$(INSTALL_BIN) ./files/etc/uci-defaults/99-pigeonmesh $(1)/etc/uci-defaults/99-pigeonmesh
+	$(INSTALL_BIN) $(PM_SRC)/etc/uci-defaults/99-pigeonmesh $(1)/etc/uci-defaults/99-pigeonmesh
 endef
 
-define Package/pigeonmesh/postinst
-#!/bin/sh
-[ -n "$$IPKG_INSTROOT" ] && exit 0
-mkdir -p /var/lib/pigeonmesh /etc/pigeonmesh/store
-[ -x /etc/uci-defaults/99-pigeonmesh ] && sh /etc/uci-defaults/99-pigeonmesh
-/etc/init.d/pigeonmesh enable
-/etc/init.d/pigeonmesh restart
-exit 0
-endef
-
-define Package/pigeonmesh/prerm
-#!/bin/sh
-[ -n "$$IPKG_INSTROOT" ] && exit 0
-/etc/init.d/pigeonmesh stop
-/etc/init.d/pigeonmesh disable
-uci -q delete firewall.pigeonmesh_peer
-uci -q delete firewall.pigeonmesh_disc
-uci -q delete firewall.pigeonmesh_http
-uci -q commit firewall
-uci -q delete dhcp.pigeonmesh
-uci -q commit dhcp
-exit 0
-endef
+# The same two scripts build/build.sh ships, so an SDK build and a hand build
+# behave identically on the router.
+Package/pigeonmesh/postinst = $(file < $(PM_SCRIPTS)/post-install)
+Package/pigeonmesh/prerm = $(file < $(PM_SCRIPTS)/pre-deinstall)
 
 $(eval $(call BuildPackage,pigeonmesh))
