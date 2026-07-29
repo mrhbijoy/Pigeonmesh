@@ -1,0 +1,38 @@
+#!/bin/sh /etc/rc.common
+# PigeonMesh node daemon
+
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/sbin/pigeonmeshd
+
+start_service() {
+	config_load pigeonmesh
+	local enabled
+	config_get_bool enabled main enabled 1
+	[ "$enabled" = "1" ] || return 0
+
+	mkdir -p /var/lib/pigeonmesh
+	mkdir -p /etc/pigeonmesh/store
+
+	procd_open_instance
+	procd_set_param command "$PROG"
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	# A crashed node in a disaster is worse than a slow one: always come back.
+	procd_set_param respawn 3600 5 0
+	procd_set_param pidfile /var/run/pigeonmeshd.pid
+	# Checkpointing on shutdown needs a moment; SIGTERM then wait.
+	procd_set_param term_timeout 10
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger "pigeonmesh"
+}
+
+reload_service() {
+	stop
+	start
+}

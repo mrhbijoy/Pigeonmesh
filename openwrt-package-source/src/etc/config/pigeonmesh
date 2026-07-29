@@ -1,0 +1,45 @@
+config pigeonmesh 'main'
+	option enabled '1'
+
+	# Leave blank to use the router's hostname.
+	option node_name ''
+
+	# Router-to-router mesh link, and LAN discovery beacons.
+	option peer_port '7100'
+	option disc_port '7101'
+
+	# The app and its API. uhttpd keeps port 80 and LuCI keeps working.
+	option http_port '8080'
+	option http_addr '0.0.0.0'
+	option docroot '/www/pigeonmesh'
+
+	# Storage budget. The defaults suit a router with 8 MB of free flash;
+	# raise max_bytes on anything roomier. The hot log lives in tmpfs and
+	# is checkpointed to flash on the interval below, so a power cut costs
+	# at most checkpoint_interval seconds of records rather than all of them.
+	option max_bytes '2097152'
+	option max_records '4000'
+	option max_body '16384'
+	option checkpoint_interval '300'
+	option hot_path '/var/lib/pigeonmesh/records.jsonl'
+	option checkpoint_path '/etc/pigeonmesh/store/records.jsonl'
+
+	# Replication. Records flood immediately for latency; a gossip round
+	# every gossip_interval seconds repairs whatever the flood lost.
+	option max_hops '8'
+	option gossip_interval '5'
+	option beacon_interval '10'
+	option peer_timeout '45'
+
+	# Per-client POST budget: sustained records/second and burst depth.
+	option post_rate '3'
+	option post_burst '30'
+
+	option domain 'pigeon.mesh'
+
+	# 0 = errors only, 1 = normal, 2 = verbose
+	option log_level '1'
+
+	# Routers that cannot hear each other's broadcasts -- a directional
+	# link, a VPN, a different subnet -- go here as "ip" or "ip:port".
+	# list peers '192.168.2.1'

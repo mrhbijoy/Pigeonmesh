@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>PigeonMesh crypto self-test</title>
+<style>
+  body { font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace; padding: 1.5rem;
+         background: #0d1117; color: #c9d1d9; }
+  h1 { font-size: 1.1rem; }
+  .pass { color: #3fb950; }
+  .fail { color: #f85149; font-weight: 700; }
+  .row { padding: 2px 0; }
+  #summary { margin: 1rem 0; padding: .75rem; border-radius: 6px; font-weight: 700; }
+  .ok { background: #12331c; color: #3fb950; }
+  .bad { background: #3d1416; color: #f85149; }
+  small { color: #8b949e; }
+</style>
+<h1>PigeonMesh crypto self-test</h1>
+<p><small>Official test vectors: FIPS 180-4 (SHA-512), RFC 8032 (Ed25519),
+RFC 7748 (X25519), RFC 8439 (ChaCha20-Poly1305).</small></p>
+<div id="summary">running…</div>
+<div id="out"></div>
+
+<script src="crypto.js"></script>
+<script>
+const out = document.getElementById('out');
+let pass = 0, fail = 0;
+
+function check(name, got, want) {
+  const okv = got === want;
+  okv ? pass++ : fail++;
+  const d = document.createElement('div');
+  d.className = 'row ' + (okv ? 'pass' : 'fail');
+  d.textContent = (okv ? '  PASS  ' : '  FAIL  ') + name;
+  if (!okv) {
+    d.textContent += '\n          got  ' + got + '\n          want ' + want;
+    d.style.whiteSpace = 'pre';
+  }
+  out.appendChild(d);
+}
+
+const H = PM.fromHex, X = PM.toHex;
+
+// ---------------------------------------------------------------- SHA-512
+check('SHA-512("abc")',
+  X(PM.sha512(PM.utf8('abc'))),
+  'ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a' +
+  '2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f');
+
+check('SHA-512("")',
+  X(PM.sha512(new Uint8Array(0))),
+  'cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce' +
+  '47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e');
+
+// A multi-block message exercises the padding boundary.
+check('SHA-512(200 x "a")',
+  X(PM.sha512(PM.utf8('a'.repeat(200)))),
+  '4b11459c33f52a22ee8236782714c150a3b2c60994e9acee17fe68947a3e6789' +
+  'f31e7668394592da7bef827cddca88c4e6f86e4df7ed1ae6cba71f3e98faee9f');
+
+// ---------------------------------------------------------------- Ed25519
+// RFC 8032, section 7.1, TEST 1 (empty message)
+{
+  const sk = H('9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60');
+  const kp = PM.ed25519KeyPair(sk);
+  check('Ed25519 TEST 1 public key', X(kp.public),
+    'd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a');
+  check('Ed25519 TEST 1 signature', X(PM.ed25519Sign(new Uint8Array(0), kp)),
+    'e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155' +
+    '5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b');
+  check('Ed25519 TEST 1 verify',
+    String(PM.ed25519Verify(new Uint8Array(0),
+      H('e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155' +
+        '5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b'),
+      kp.public)), 'true');
+}
+
+// RFC 8032, section 7.1, TEST 2 (one-byte message)
+{
+  const sk = H('4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb');
+  const kp = PM.ed25519KeyPair(sk);
+  const msg = H('72');
+  check('Ed25519 TEST 2 public key', X(kp.public),
+    '3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c');
+  check('Ed25519 TEST 2 signature', X(PM.ed25519Sign(msg, kp)),
+    '92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da' +
+    '085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00');
+  check('Ed25519 TEST 2 verify',
+    String(PM.ed25519Verify(msg, PM.ed25519Sign(msg, kp), kp.public)), 'true');
+}
+
+// A tampered message must not verify -- this is the property the whole
+// trust model rests on.
+{
+  const kp = PM.ed25519KeyPair(H('4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb'));
+  const sig = PM.ed25519Sign(PM.utf8('shelter at school'), kp);
+  check('Ed25519 rejects tampered message',
+    String(PM.ed25519Verify(PM.utf8('shelter at mosque'), sig, kp.public)), 'false');
+  const bad = new Uint8Array(kp.public); bad[0] ^= 1;
+  check('Ed25519 rejects wrong public key',
+    String(PM.ed25519Verify(PM.utf8('shelter at school'), sig, bad)), 'false');
+}
+
+// ----------------------------------------------------------------- X25519
+// RFC 7748, section 6.1
+{
+  const aSk = H('77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a');
+  const bSk = H('5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb');
+  const aPk = PM.x25519(aSk, PM.X25519_BASE);
+  const bPk = PM.x25519(bSk, PM.X25519_BASE);
+  check('X25519 Alice public', X(aPk),
+    '8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a');
+  check('X25519 Bob public', X(bPk),
+    'de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f');
+  check('X25519 shared secret', X(PM.x25519(aSk, bPk)),
+    '4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742');
+  check('X25519 both sides agree', X(PM.x25519(aSk, bPk)), X(PM.x25519(bSk, aPk)));
+}
+
+// -------------------------------------------------------------- Poly1305
+// RFC 8439, section 2.5.2
+check('Poly1305 vector',
+  X(PM.poly1305(H('85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b'),
+    PM.utf8('Cryptographic Forum Research Group'))),
+  'a8061dc1305136c6c22b8baf0c0127a9');
+
+// ------------------------------------------------------ ChaCha20-Poly1305
+// RFC 8439, section 2.8.2
+{
+  const key = H('808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f');
+  const nonce = H('070000004041424344454647');
+  const aad = H('50515253c0c1c2c3c4c5c6c7');
+  const pt = PM.utf8("Ladies and Gentlemen of the class of '99: If I could offer you " +
+    "only one tip for the future, sunscreen would be it.");
+  const sealed = PM.aeadSeal(key, nonce, pt, aad);
+  check('ChaCha20-Poly1305 ciphertext', X(sealed.slice(0, sealed.length - 16)),
+    'd31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d6' +
+    '3dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b36' +
+    '92ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc' +
+    '3ff4def08e4b7a9de576d26586cec64b6116');
+  check('ChaCha20-Poly1305 tag', X(sealed.slice(sealed.length - 16)),
+    '1ae10b594f09e26a7e902ecbd0600691');
+  check('ChaCha20-Poly1305 round trip',
+    PM.fromUtf8(PM.aeadOpen(key, nonce, sealed, aad)), PM.fromUtf8(pt));
+
+  const mauled = new Uint8Array(sealed); mauled[3] ^= 0x40;
+  check('ChaCha20-Poly1305 rejects tampered ciphertext',
+    String(PM.aeadOpen(key, nonce, mauled, aad)), 'null');
+  check('ChaCha20-Poly1305 rejects wrong AAD',
+    String(PM.aeadOpen(key, nonce, sealed, H('00'))), 'null');
+}
+
+// ------------------------------------------------------ PigeonMesh layer
+{
+  const alice = PM.newIdentity('Ayesha');
+  const bob = PM.newIdentity('Bijoy');
+
+  const rec = {
+    id: PM.newRecordId(), kind: 'sos', ts: 1753600000, exp: 1753686400,
+    chan: 'sos', nick: 'Ayesha',
+    body: { text: 'Roof collapsed, three people inside', lat: 23.81, lon: 90.41 },
+  };
+  PM.signRecord(rec, alice);
+  check('record verifies after signing', String(PM.verifyRecord(rec)), 'true');
+
+  const tampered = JSON.parse(JSON.stringify(rec));
+  tampered.body.text = 'All clear, no help needed';
+  check('record rejects edited body', String(PM.verifyRecord(tampered)), 'false');
+
+  const impersonated = JSON.parse(JSON.stringify(rec));
+  impersonated.author = bob.fp;
+  check('record rejects swapped author', String(PM.verifyRecord(impersonated)), 'false');
+
+  const env = PM.sealDM('meet at the shelter behind the school', alice.dh_secret, bob.dh_public);
+  check('DM decrypts for the recipient',
+    PM.openDM(env, bob.dh_secret, alice.dh_public),
+    'meet at the shelter behind the school');
+
+  const eve = PM.newIdentity('Eve');
+  check('DM stays closed to a third party',
+    String(PM.openDM(env, eve.dh_secret, alice.dh_public)), 'null');
+
+  check('fingerprint is stable', alice.fp, PM.fingerprint(PM.fromB64(alice.ed_public)));
+}
+
+// -------------------------------------------------------------- timing
+{
+  const t0 = performance.now();
+  const kp = PM.ed25519KeyPair();
+  const t1 = performance.now();
+  const sig = PM.ed25519Sign(PM.utf8('x'.repeat(200)), kp);
+  const t2 = performance.now();
+  PM.ed25519Verify(PM.utf8('x'.repeat(200)), sig, kp.public);
+  const t3 = performance.now();
+  const d = document.createElement('div');
+  d.className = 'row';
+  d.innerHTML = `<small>timing on this device: keygen ${(t1 - t0).toFixed(1)} ms, ` +
+    `sign ${(t2 - t1).toFixed(1)} ms, verify ${(t3 - t2).toFixed(1)} ms</small>`;
+  out.appendChild(d);
+}
+
+const s = document.getElementById('summary');
+s.textContent = `${pass} passed, ${fail} failed`;
+s.className = fail === 0 ? 'ok' : 'bad';
+document.title = (fail === 0 ? 'PASS ' : 'FAIL ') + document.title;
+</script>

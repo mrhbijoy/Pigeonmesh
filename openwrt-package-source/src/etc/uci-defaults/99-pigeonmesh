@@ -1,0 +1,58 @@
+#!/bin/sh
+# Runs once, on install and on first boot after a sysupgrade.
+#
+# Three jobs: let mesh traffic through the firewall on the LAN side only,
+# make pigeon.mesh resolve to this router, and leave a breadcrumb in LuCI.
+# Everything here is idempotent and reversible.
+
+. /lib/functions.sh
+
+PM_PEER_PORT=$(uci -q get pigeonmesh.main.peer_port || echo 7100)
+PM_DISC_PORT=$(uci -q get pigeonmesh.main.disc_port || echo 7101)
+PM_HTTP_PORT=$(uci -q get pigeonmesh.main.http_port || echo 8080)
+PM_DOMAIN=$(uci -q get pigeonmesh.main.domain || echo pigeon.mesh)
+
+# ---------------------------------------------------------------- firewall
+# The mesh is a LAN-side service. Nothing here opens a port to the WAN: a
+# node reachable from the internet is a node an adversary can enumerate.
+add_rule() {
+	local name="$1" proto="$2" port="$3"
+	uci -q delete "firewall.$name"
+	uci set "firewall.$name=rule"
+	uci set "firewall.$name.name=$4"
+	uci set "firewall.$name.src=lan"
+	uci set "firewall.$name.proto=$proto"
+	uci set "firewall.$name.dest_port=$port"
+	uci set "firewall.$name.target=ACCEPT"
+}
+
+add_rule pigeonmesh_peer tcp "$PM_PEER_PORT" "PigeonMesh mesh link"
+add_rule pigeonmesh_disc udp "$PM_DISC_PORT" "PigeonMesh discovery"
+add_rule pigeonmesh_http tcp "$PM_HTTP_PORT" "PigeonMesh app"
+uci commit firewall
+
+# ---------------------------------------------------------------- dns
+# Give the app a name people can type from memory and read off a wall.
+# On OpenWrt 25.x network.lan.ipaddr can carry a prefix ("192.168.3.1/24").
+# Feeding that to dnsmasq silently breaks name resolution, so strip it.
+LAN_IP=$(uci -q get network.lan.ipaddr | cut -d/ -f1)
+[ -z "$LAN_IP" ] && LAN_IP=$(ip -4 -o addr show br-lan 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+
+if [ -n "$LAN_IP" ]; then
+	uci -q delete dhcp.pigeonmesh
+	uci set dhcp.pigeonmesh=domain
+	uci set dhcp.pigeonmesh.name="$PM_DOMAIN"
+	uci set dhcp.pigeonmesh.ip="$LAN_IP"
+	uci commit dhcp
+fi
+
+# ---------------------------------------------------------------- apply
+# uci-defaults also runs during image build, where no services exist yet.
+if [ -d /var/run ] && [ -x /etc/init.d/firewall ]; then
+	/etc/init.d/firewall reload >/dev/null 2>&1
+fi
+if [ -d /var/run ] && [ -x /etc/init.d/dnsmasq ]; then
+	/etc/init.d/dnsmasq reload >/dev/null 2>&1
+fi
+
+exit 0

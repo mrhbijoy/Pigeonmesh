@@ -1,0 +1,698 @@
+#!/usr/bin/env lua
+-- pigeonmeshd -- PigeonMesh node daemon for OpenWrt
+--
+-- One process per router. It does four things:
+--
+--   1. Finds neighbouring routers (UDP beacons on the LAN, plus a static
+--      peer list for point-to-point links) and keeps TCP sessions to them.
+--   2. Replicates signed records across those links. New records flood
+--      immediately so chat feels instant; a Bloom-summary gossip round runs
+--      on a timer to repair whatever the flood lost.
+--   3. Serves the PWA and its API directly, including a Server-Sent Events
+--      stream, so a browser sees an SOS the moment it lands on the node.
+--   4. Accepts the same reconciliation over HTTP from phones, which turns
+--      every person walking between two islands of the mesh into a carrier.
+--
+-- Everything is Lua 5.1 + nixio, both already on every OpenWrt image with
+-- LuCI. No compiled code, so one noarch package runs on every target.
+
+package.path = "/usr/lib/lua/?.lua;/usr/lib/lua/?/init.lua;" .. package.path
+
+local nixio  = require("nixio")
+local bit    = nixio.bit
+local CS     = nixio.const_sock
+local json   = require("pigeonmesh.json")
+local util   = require("pigeonmesh.util")
+local store  = require("pigeonmesh.store")
+local httpd  = require("pigeonmesh.httpd")
+local api    = require("pigeonmesh.api")
+
+local VERSION = "1.0.0"
+
+local EAGAIN      = CS.EAGAIN or 11
+local EWOULDBLOCK = CS.EWOULDBLOCK or 11
+
+local EV_IN  = nixio.poll_flags("in")
+local EV_OUT = nixio.poll_flags("out")
+local EV_ERR = nixio.poll_flags("err")
+local EV_HUP = nixio.poll_flags("hup")
+
+-- ------------------------------------------------------------------
+-- Configuration
+-- ------------------------------------------------------------------
+
+local CFG = {
+    peer_port           = 7100,
+    disc_port           = 7101,
+    http_port           = 8080,
+    http_addr           = "0.0.0.0",
+    docroot             = "/www/pigeonmesh",
+    hot_path            = "/var/lib/pigeonmesh/records.jsonl",
+    checkpoint_path     = "/etc/pigeonmesh/store/records.jsonl",
+    max_bytes           = 2 * 1024 * 1024,
+    max_records         = 4000,
+    max_body            = 16384,
+    max_hops            = 8,
+    beacon_interval     = 10,
+    gossip_interval     = 5,
+    peer_timeout        = 45,
+    checkpoint_interval = 300,
+    post_rate           = 3,
+    post_burst          = 30,
+    domain              = "pigeon.mesh",
+    log_level           = 1,
+}
+
+local u = util.uci_load("pigeonmesh", "main")
+if u.enabled == "0" or u.enabled == "false" then
+    io.stderr:write("[pigeonmeshd] disabled in /etc/config/pigeonmesh; exiting\n")
+    os.exit(0)
+end
+for _, k in ipairs({ "peer_port", "disc_port", "http_port", "max_bytes",
+                     "max_records", "max_body", "max_hops", "beacon_interval",
+                     "gossip_interval", "peer_timeout", "checkpoint_interval",
+                     "post_rate", "post_burst", "log_level" }) do
+    if u[k] then CFG[k] = tonumber(u[k]) or CFG[k] end
+end
+for _, k in ipairs({ "http_addr", "docroot", "hot_path", "checkpoint_path", "domain" }) do
+    if u[k] and #u[k] > 0 then CFG[k] = u[k] end
+end
+
+local static_peers = {}
+if type(u.peers) == "table" then
+    for _, p in ipairs(u.peers) do static_peers[#static_peers + 1] = p end
+elseif type(u.peers) == "string" and #u.peers > 0 then
+    static_peers[1] = u.peers
+end
+
+local function logf(level, fmt, ...)
+    if level > CFG.log_level then return end
+    io.stderr:write(string.format("[pigeonmeshd] " .. fmt .. "\n", ...))
+end
+
+-- ------------------------------------------------------------------
+-- Identity and shared state
+-- ------------------------------------------------------------------
+
+local NODE_ID   = util.node_id()
+local NODE_NAME = (u.node_name and #u.node_name > 0) and u.node_name or util.hostname()
+
+-- Seed from the node id as well as the clock: routers that boot together
+-- after a power cut share a wall clock, and identical seeds would make them
+-- pick the same gossip peer every round.
+math.randomseed(util.now() + (tonumber(NODE_ID:sub(-4), 16) or 0))
+
+util.mkdir_p("/var/lib/pigeonmesh")
+util.mkdir_p(CFG.checkpoint_path:match("^(.*)/[^/]+$") or "/etc/pigeonmesh/store")
+
+local db = store.new({
+    max_bytes = CFG.max_bytes,
+    max_records = CFG.max_records,
+    hot_path = CFG.hot_path,
+    checkpoint_path = CFG.checkpoint_path,
+})
+local loaded = db:load()
+logf(1, "loaded %d records (%d bytes) from disk", loaded, db.bytes)
+
+local ctx = {
+    cfg = CFG,
+    store = db,
+    node_id = NODE_ID,
+    node_name = NODE_NAME,
+    version = VERSION,
+    peers = {},          -- node id -> peer record (direct TCP links)
+    remote_nodes = {},   -- node id -> last status heard via gossip
+    channels = { "public", "sos", "relief", "medical" },
+    stat_flooded = 0,
+    stat_gossip = 0,
+    stat_carried_in = 0,
+    stat_carried_out = 0,
+}
+
+-- ------------------------------------------------------------------
+-- Peer transport
+--
+-- Line-delimited JSON over TCP, one connection per neighbour. Short field
+-- names keep beacons and digests inside a single packet on a weak link.
+-- ------------------------------------------------------------------
+
+local conns = {}  -- nixio socket -> connection record
+
+local function conn_send(c, obj)
+    if not c or c.dead then return end
+    c.out = (c.out or "") .. json.encode(obj) .. "\n"
+    -- Backstop: a peer that has stopped reading must not consume our RAM.
+    if #c.out > 1024 * 1024 then
+        c.dead = true
+        return
+    end
+    c.want_write = true
+end
+
+local function conn_flush(c)
+    if not c.out or #c.out == 0 then
+        c.want_write = nil
+        return true
+    end
+    while #c.out > 0 do
+        local n, e = c.fd:write(c.out)
+        if not n then
+            if e == EAGAIN or e == EWOULDBLOCK then return true end
+            return false, e
+        end
+        if n == 0 then return false, "zero" end
+        c.out = c.out:sub(n + 1)
+    end
+    c.want_write = nil
+    return true
+end
+
+local function drop_conn(fd, why)
+    local c = conns[fd]
+    if not c then return end
+    conns[fd] = nil
+    if c.node and ctx.peers[c.node] == c then
+        ctx.peers[c.node] = nil
+        logf(1, "peer lost: %s (%s) -- %s", c.node, c.name or "?", why or "?")
+    end
+    pcall(function() fd:close() end)
+end
+
+local function each_peer(fn)
+    for id, c in pairs(ctx.peers) do fn(id, c) end
+end
+
+-- ------------------------------------------------------------------
+-- Record propagation
+-- ------------------------------------------------------------------
+
+local server  -- forward declaration; set once the HTTP server is up
+
+-- Called for every record that is new to this node, wherever it came from.
+local function on_new_record(rec, from_node)
+    -- Push to every browser attached to this node first. A person standing
+    -- in front of the router should never wait on mesh timers.
+    if server then
+        server:sse_broadcast("rec", json.encode(db:externalise(rec)))
+    end
+
+    -- Then flood to neighbours, minus the one that told us.
+    if rec.hops < CFG.max_hops then
+        local out = db:externalise(rec)
+        out.hops = rec.hops + 1
+        local payload = { t = "rec", r = out }
+        each_peer(function(id, c)
+            if id ~= from_node then
+                conn_send(c, payload)
+                ctx.stat_flooded = ctx.stat_flooded + 1
+            end
+        end)
+    end
+end
+ctx.on_new_record = on_new_record
+
+local function ingest(raw, from_node)
+    local rec, why = store.validate(raw, CFG.max_body)
+    if not rec then return false, why end
+    if db:has(rec.id) then return false, "duplicate" end
+    local put, status = db:put(rec)
+    if not put then return false, status end
+    on_new_record(put, from_node)
+    return true
+end
+
+-- ------------------------------------------------------------------
+-- Peer message handling
+-- ------------------------------------------------------------------
+
+local function send_hello(c)
+    conn_send(c, {
+        t = "hello", node = NODE_ID, name = NODE_NAME,
+        ver = VERSION, http = CFG.http_port,
+    })
+end
+
+local function register_peer(c, obj)
+    local id = util.sanitise(obj.node, 32)
+    if not id or id == NODE_ID then
+        -- Talking to ourselves (our own beacon came back on another
+        -- interface). Close rather than loop records around.
+        c.dead = true
+        return false
+    end
+    local existing = ctx.peers[id]
+    if existing and existing ~= c then
+        -- Two routers that beacon at the same moment each dial the other.
+        -- Both would otherwise keep a half-useful link. Break the tie the
+        -- same way on both sides: the lexicographically smaller node id
+        -- keeps the connection it initiated.
+        local keep_ours = (NODE_ID < id) == (c.outbound == true)
+        if keep_ours then
+            existing.dead = true
+        else
+            c.dead = true
+            return false
+        end
+    end
+    local already = (c.node == id)
+    c.node = id
+    c.name = util.sanitise(obj.name, 48) or "node"
+    c.http = tonumber(obj.http)
+    c.last_seen = util.now()
+    ctx.peers[id] = c
+    -- A handshake identifies the peer twice (hello then hello_ack); only
+    -- announce the link the first time so the log stays readable.
+    if not already then
+        logf(1, "peer up: %s (%s) via %s", id, c.name, c.addr or "?")
+    end
+    return true
+end
+
+-- Ask a peer to fill in whatever the flood missed.
+local function send_digest(c)
+    local d = db:digest()
+    conn_send(c, { t = "sum", b = d, n = d.count, node = NODE_ID })
+    ctx.stat_gossip = ctx.stat_gossip + 1
+end
+
+local function node_status()
+    local links = {}
+    for id in pairs(ctx.peers) do links[#links + 1] = id end
+    return {
+        t = "stat", node = NODE_ID, name = NODE_NAME,
+        battery = util.battery_pct(), records = db:count(),
+        uptime = util.uptime(), mem = util.mem_free_kb(),
+        links = links, hops = 0, ts = util.now(),
+    }
+end
+
+local function handle_peer_line(c, line)
+    local obj = json.decode(line)
+    if not obj or type(obj.t) ~= "string" then return end
+    c.last_seen = util.now()
+
+    local t = obj.t
+
+    if t == "hello" then
+        -- The dialer sends hello; we identify ourselves in the ack rather
+        -- than sending a second hello, which would make both sides register
+        -- each other twice.
+        if register_peer(c, obj) then
+            conn_send(c, { t = "hello_ack", node = NODE_ID, name = NODE_NAME,
+                           http = CFG.http_port })
+            send_digest(c)
+        end
+        return
+    end
+
+    if t == "hello_ack" then
+        register_peer(c, obj)
+        send_digest(c)
+        return
+    end
+
+    -- Everything past this point requires an identified peer.
+    if not c.node then return end
+
+    if t == "rec" then
+        if type(obj.r) == "table" then ingest(obj.r, c.node) end
+    elseif t == "recs" then
+        if type(obj.r) == "table" then
+            local n = 0
+            for _, raw in ipairs(obj.r) do
+                if ingest(raw, c.node) then n = n + 1 end
+            end
+            if n > 0 then logf(2, "gossip: took %d records from %s", n, c.node) end
+        end
+    elseif t == "sum" then
+        -- The peer told us what it has; send back what it lacks.
+        if type(obj.b) == "table" then
+            local give = db:missing_from(obj.b, 48, 48 * 1024)
+            if #give > 0 then
+                conn_send(c, { t = "recs", r = give })
+                logf(2, "gossip: offering %d records to %s", #give, c.node)
+            end
+            -- If the peer looks like it holds more than we do, ask for a
+            -- round in the other direction too.
+            if (tonumber(obj.n) or 0) > db:count() then
+                send_digest(c)
+            end
+        end
+    elseif t == "stat" then
+        local id = util.sanitise(obj.node, 32)
+        local hops = math.floor(tonumber(obj.hops) or 0)
+        if id and id ~= NODE_ID and hops < 6 then
+            local prev = ctx.remote_nodes[id]
+            local fresh = not prev or (tonumber(obj.ts) or 0) > (prev.ts or 0)
+            if fresh then
+                local links = {}
+                if type(obj.links) == "table" then
+                    for _, l in ipairs(obj.links) do
+                        links[#links + 1] = util.sanitise(l, 32)
+                    end
+                end
+                ctx.remote_nodes[id] = {
+                    name = util.sanitise(obj.name, 48),
+                    battery = tonumber(obj.battery),
+                    records = tonumber(obj.records),
+                    uptime = tonumber(obj.uptime),
+                    links = links, hops = hops + 1,
+                    ts = tonumber(obj.ts), last_seen = util.now(),
+                }
+                -- Relay onward so distant nodes appear on everyone's map.
+                obj.hops = hops + 1
+                each_peer(function(pid, pc)
+                    if pid ~= c.node then conn_send(pc, obj) end
+                end)
+                if server then
+                    server:sse_broadcast("peers", json.encode(api.peer_list and api.peer_list() or {}))
+                end
+            end
+        end
+    elseif t == "ping" then
+        conn_send(c, { t = "pong", ts = obj.ts })
+    elseif t == "pong" then
+        if obj.ts then
+            c.rtt_ms = math.floor((util.monotonic() - obj.ts) * 1000)
+        end
+    end
+end
+
+-- ------------------------------------------------------------------
+-- Connection setup
+-- ------------------------------------------------------------------
+
+local function adopt(fd, addr, outbound)
+    fd:setblocking(false)
+    local c = {
+        fd = fd, addr = addr, inbuf = "", out = "",
+        last_seen = util.now(), outbound = outbound or false,
+    }
+    conns[fd] = c
+    return c
+end
+
+local function connect_peer(ip, port)
+    port = port or CFG.peer_port
+    for _, c in pairs(conns) do
+        if c.addr == ip and not c.dead then return end  -- already linked
+    end
+    local s = nixio.socket("inet", "stream")
+    if not s then return end
+    s:setblocking(true)
+    s:setsockopt("socket", "sndtimeo", 3)
+    s:setsockopt("socket", "rcvtimeo", 3)
+    local okc = s:connect(ip, port)
+    if not okc then
+        s:close()
+        return
+    end
+    local c = adopt(s, ip, true)
+    send_hello(c)
+    c.said_hello = true
+    logf(2, "dialled %s:%d", ip, port)
+end
+
+-- ------------------------------------------------------------------
+-- Sockets
+-- ------------------------------------------------------------------
+
+local peer_srv = nixio.bind("0.0.0.0", CFG.peer_port, "inet", "stream")
+if not peer_srv then
+    logf(0, "FATAL: cannot bind TCP %d", CFG.peer_port)
+    os.exit(1)
+end
+peer_srv:setsockopt("socket", "reuseaddr", 1)
+peer_srv:setblocking(false)
+peer_srv:listen(16)
+
+local disc_srv = nixio.bind("0.0.0.0", CFG.disc_port, "inet", "dgram")
+if not disc_srv then
+    logf(0, "FATAL: cannot bind UDP %d", CFG.disc_port)
+    os.exit(1)
+end
+disc_srv:setsockopt("socket", "reuseaddr", 1)
+disc_srv:setblocking(false)
+
+local disc_tx = nixio.socket("inet", "dgram")
+disc_tx:setsockopt("socket", "broadcast", 1)
+disc_tx:setblocking(false)
+
+server = httpd.new({
+    addr = CFG.http_addr,
+    port = CFG.http_port,
+    docroot = CFG.docroot,
+    max_body = CFG.max_body * 8,
+    log = function(fmt, ...) logf(1, fmt, ...) end,
+})
+if not server then
+    logf(0, "FATAL: cannot bind HTTP %s:%d", CFG.http_addr, CFG.http_port)
+    os.exit(1)
+end
+ctx.server = server
+server.handler = api.make_handler(ctx)
+
+logf(0, "PigeonMesh %s up: node=%s name=%s peers=:%d disc=:%d http=:%d",
+     VERSION, NODE_ID, NODE_NAME, CFG.peer_port, CFG.disc_port, CFG.http_port)
+
+-- ------------------------------------------------------------------
+-- Discovery
+-- ------------------------------------------------------------------
+
+local function send_beacon()
+    local b = json.encode({
+        t = "beacon", node = NODE_ID, name = NODE_NAME,
+        port = CFG.peer_port, http = CFG.http_port, ts = util.now(),
+    })
+    disc_tx:sendto(b, "255.255.255.255", CFG.disc_port)
+    for _, i in ipairs(util.interfaces()) do
+        if i.bcast and i.bcast ~= "0.0.0.0" and not i.dev:match("^tailscale") then
+            disc_tx:sendto(b, i.bcast, CFG.disc_port)
+        end
+    end
+end
+
+local function handle_beacon(data, src)
+    local obj = json.decode(data)
+    if not obj or obj.t ~= "beacon" then return end
+    local id = util.sanitise(obj.node, 32)
+    if not id or id == NODE_ID then return end
+    local existing = ctx.peers[id]
+    if existing and not existing.dead then
+        existing.last_seen = util.now()
+        return
+    end
+    -- Only the lexicographically smaller node dials, so two routers that
+    -- discover each other simultaneously end up with one connection.
+    if NODE_ID < id then
+        logf(2, "beacon from %s at %s -- dialling", id, src)
+        connect_peer(src, tonumber(obj.port) or CFG.peer_port)
+    end
+end
+
+-- ------------------------------------------------------------------
+-- Shutdown
+-- ------------------------------------------------------------------
+
+local running = true
+local function shutdown()
+    running = false
+end
+pcall(function()
+    nixio.signal("SIGTERM", shutdown)
+    nixio.signal("SIGINT", shutdown)
+    -- A router losing mains power gets a SIGTERM from procd if it is lucky.
+    -- Ignore SIGPIPE so a peer vanishing mid-write cannot kill the node.
+    nixio.signal("SIGPIPE", "ign")
+end)
+
+-- ------------------------------------------------------------------
+-- Main loop
+-- ------------------------------------------------------------------
+
+for _, p in ipairs(static_peers) do
+    local ip, port = p:match("^([^:]+):(%d+)$")
+    if not ip then ip, port = p, CFG.peer_port else port = tonumber(port) end
+    connect_peer(ip, port)
+end
+
+local last_beacon, last_gossip, last_maint, last_ckpt, last_stat = 0, 0, 0, 0, 0
+send_beacon()
+
+while running do
+    local pollfds = {
+        { fd = peer_srv, events = EV_IN },
+        { fd = disc_srv, events = EV_IN },
+    }
+    server:pollfds(pollfds)
+    for fd, c in pairs(conns) do
+        local ev = EV_IN
+        if c.want_write then ev = bit.bor(ev, EV_OUT) end
+        pollfds[#pollfds + 1] = { fd = fd, events = ev, _peer = true }
+    end
+
+    local okp = pcall(function() nixio.poll(pollfds, 1000) end)
+    if not okp then
+        -- poll() returns EINTR when a signal lands. Loop round and let the
+        -- running flag decide whether to continue.
+        nixio.nanosleep(0, 20000000)
+    end
+
+    for _, p in ipairs(pollfds) do
+        local rev = p.revents
+        if rev and rev ~= 0 then
+            if p.fd == peer_srv then
+                if bit.band(rev, EV_IN) ~= 0 then
+                    local newfd, host = peer_srv:accept()
+                    if newfd then adopt(newfd, tostring(host), false) end
+                end
+            elseif p.fd == disc_srv then
+                if bit.band(rev, EV_IN) ~= 0 then
+                    local data, host = disc_srv:recvfrom(4096)
+                    if data and host then
+                        pcall(handle_beacon, data, tostring(host))
+                    end
+                end
+            elseif p._peer then
+                local c = conns[p.fd]
+                if c then
+                    if bit.band(rev, bit.bor(EV_IN, EV_HUP)) ~= 0 then
+                        local data, e = p.fd:read(32768)
+                        if not data then
+                            if e ~= EAGAIN and e ~= EWOULDBLOCK then
+                                drop_conn(p.fd, "read " .. tostring(e))
+                            end
+                        elseif #data == 0 then
+                            drop_conn(p.fd, "eof")
+                        else
+                            c.inbuf = c.inbuf .. data
+                            if #c.inbuf > 2 * 1024 * 1024 then
+                                drop_conn(p.fd, "oversize frame")
+                            else
+                                while conns[p.fd] do
+                                    local nl = c.inbuf:find("\n", 1, true)
+                                    if not nl then break end
+                                    local line = c.inbuf:sub(1, nl - 1):gsub("\r$", "")
+                                    c.inbuf = c.inbuf:sub(nl + 1)
+                                    local okh, e2 = pcall(handle_peer_line, c, line)
+                                    if not okh then
+                                        logf(1, "peer handler error: %s", tostring(e2))
+                                    end
+                                    if c.dead then drop_conn(p.fd, "protocol") end
+                                end
+                            end
+                        end
+                    end
+                    if conns[p.fd] and bit.band(rev, EV_OUT) ~= 0 then
+                        local okw, e3 = conn_flush(c)
+                        if not okw then drop_conn(p.fd, "write " .. tostring(e3)) end
+                    end
+                    if conns[p.fd] and bit.band(rev, EV_ERR) ~= 0 then
+                        drop_conn(p.fd, "poll error")
+                    end
+                end
+            else
+                -- A malformed request must never take the node down. In a
+                -- disaster the daemon staying up matters more than any one
+                -- response being correct, so failures are logged and the
+                -- offending connection is dropped.
+                local okh, eh = pcall(server.handle, server, p.fd, rev)
+                if not okh then
+                    logf(0, "http handler error: %s", tostring(eh))
+                    pcall(function() p.fd:close() end)
+                    if server.conns[p.fd] then
+                        server.conns[p.fd] = nil
+                        server.sse[p.fd] = nil
+                        server.nconns = server.nconns - 1
+                    end
+                end
+            end
+        end
+    end
+
+    -- Flush anything queued during this pass.
+    for fd, c in pairs(conns) do
+        if c.dead then
+            drop_conn(fd, "marked dead")
+        elseif c.want_write then
+            local okw, e = conn_flush(c)
+            if not okw then drop_conn(fd, "write " .. tostring(e)) end
+        end
+    end
+
+    local now = util.monotonic()
+
+    if now - last_beacon >= CFG.beacon_interval then
+        last_beacon = now
+        send_beacon()
+        each_peer(function(_, c) conn_send(c, { t = "ping", ts = now }) end)
+    end
+
+    if now - last_gossip >= CFG.gossip_interval then
+        last_gossip = now
+        -- One random neighbour per round. Gossiping to everyone every tick
+        -- would turn a dense mesh into a broadcast storm; one peer per round
+        -- still converges in O(log n) rounds.
+        local ids = {}
+        for id in pairs(ctx.peers) do ids[#ids + 1] = id end
+        if #ids > 0 then
+            local pick = ctx.peers[ids[math.random(#ids)]]
+            if pick then send_digest(pick) end
+        end
+    end
+
+    if now - last_stat >= 15 then
+        last_stat = now
+        local st = node_status()
+        each_peer(function(_, c) conn_send(c, st) end)
+        if server then
+            server:sse_broadcast("state", json.encode({
+                node = ctx.node_id, records = db:count(),
+                peers = (function()
+                    local n = 0
+                    for _ in pairs(ctx.peers) do n = n + 1 end
+                    return n
+                end)(),
+                battery = util.battery_pct(), time = util.now(),
+            }))
+        end
+    end
+
+    if now - last_maint >= 10 then
+        last_maint = now
+        server:tick(now)
+        api.gc_buckets()
+        local wall = util.now()
+        for fd, c in pairs(conns) do
+            if wall - (c.last_seen or 0) > CFG.peer_timeout then
+                drop_conn(fd, "timeout")
+            end
+        end
+        for id, s in pairs(ctx.remote_nodes) do
+            if util.now() - (s.last_seen or 0) > 180 then ctx.remote_nodes[id] = nil end
+        end
+        for _, p in ipairs(static_peers) do
+            local ip = p:match("^([^:]+)") or p
+            local port = tonumber(p:match(":(%d+)$")) or CFG.peer_port
+            local found = false
+            for _, c in pairs(conns) do
+                if c.addr == ip and not c.dead then found = true break end
+            end
+            if not found then connect_peer(ip, port) end
+        end
+        db:enforce_budget()
+    end
+
+    if now - last_ckpt >= CFG.checkpoint_interval then
+        last_ckpt = now
+        if db:checkpoint() then
+            logf(2, "checkpointed %d records to flash", db:count())
+        end
+    end
+end
+
+logf(0, "shutting down; checkpointing %d records", db:count())
+db.dirty = math.max(db.dirty, 1)   -- force a final write
+db:checkpoint()
+server:close()
+os.exit(0)

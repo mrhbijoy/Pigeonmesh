@@ -1,0 +1,19 @@
+# user-specific config — never commit
+config.h
+
+# PlatformIO / Arduino build artifacts
+.pio/
+.pioenvs/
+.piolibdeps
+build/
+*.bin
+*.elf
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db

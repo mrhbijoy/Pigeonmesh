@@ -1,0 +1,36 @@
+{
+  "name": "PigeonMesh — যোগাযোগ, ইন্টারনেট ছাড়াই",
+  "short_name": "PigeonMesh",
+  "description": "Crisis communication over a router mesh. Chat, SOS, safe check-in, missing persons and relief mapping with no internet.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0b1220",
+  "theme_color": "#0b1220",
+  "lang": "bn",
+  "dir": "ltr",
+  "categories": ["social", "utilities"],
+  "icons": [
+    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    {
+      "name": "SOS",
+      "short_name": "SOS",
+      "description": "Send an emergency alert to the whole mesh",
+      "url": "./#sos",
+      "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "I am safe",
+      "short_name": "Safe",
+      "description": "Mark yourself safe so family can find you",
+      "url": "./#people",
+      "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }]
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "buildCommand": "prisma generate && next build",
+  "installCommand": "bun install",
+  "functions": {
+    "src/app/api/pigeonmesh/sync/route.ts": { "maxDuration": 30 },
+    "src/app/api/pigeonmesh/events/route.ts": { "maxDuration": 60 }
+  },
+  "crons": []
+}

@@ -1,0 +1,24 @@
+# Excluded folders as requested
+pigeonmesh-apk/
+pigeonmesh-disaster-kit/
+
+# Build & binary output
+dist/
+build/
+.pio/
+.pioenvs/
+.piolibdeps/
+*.bin
+*.elf
+
+# Node / Next.js
+node_modules/
+.next/
+
+# Environment files
+.env
+.env*.local
+
+# OS files
+.DS_Store
+Thumbs.db

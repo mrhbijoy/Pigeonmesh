@@ -1,0 +1,62 @@
+// PigeonMesh Cloud Bridge — Prisma schema
+// A Vercel-deployed mesh peer that bridges internet-connected routers
+// to a global coordination dashboard.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// An append-only record log, mirroring the on-router store. Every kind of
+// content in PigeonMesh (chat, sos, checkin, missing, pin, bulletin, dm,
+// ack, profile, presence) is one row here.
+model Record {
+  id        String   @id // 128-bit hex id, generated at the source
+  kind      String       // chat | sos | checkin | missing | pin | bulletin | dm | ack | profile | presence
+  ts        BigInt       // unix seconds, set by the author
+  exp       BigInt       // expiry unix seconds
+  chan      String   @default("public")
+  nick      String   @default("anon")
+  author    String   @default("") // fingerprint of the signing key
+  pk        String?      // Ed25519 public key (base64)
+  sig       String?      // signature (base64)
+  origin    String   @default("") // node that first accepted it
+  hops      Int      @default(0)
+  body      String   @default("{}") // kind-specific JSON, opaque to relays
+  prio      Int      @default(3) // lower = higher priority; 0 = SOS, never evicted
+  size      Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([kind, ts])
+  @@index([chan, ts])
+  @@index([ts])
+  @@index([prio, ts])
+  @@index([origin])
+}
+
+// Nodes the bridge has seen. Includes itself, every router that has
+// pushed records up, and every router reported via the topology endpoint.
+model Node {
+  id        String   @id // pm-xxxxxx
+  name      String   @default("node")
+  kind      String   @default("router") // router | bridge | esp32 | apk | pwa
+  lastSeen  DateTime @default(now())
+  battery   Int?
+  hops      Int?
+  records   Int?
+  uptime    BigInt?
+  links     String   @default("[]") // JSON array of node ids
+  remote    Boolean  @default(false) // learned via gossip, not direct
+  addr      String?
+
+  @@index([lastSeen])
+}
+
+model Settings {
+  key   String @id
+  value String
+}

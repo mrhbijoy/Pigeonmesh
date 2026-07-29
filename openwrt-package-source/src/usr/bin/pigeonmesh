@@ -1,0 +1,381 @@
+#!/usr/bin/env lua
+-- pigeonmesh -- command line client and admin tool.
+--
+-- Two audiences. A person on a serial console who needs to see whether the
+-- mesh is alive, and a shell script that needs to inject a record. The second
+-- is the interesting one: a float switch wired to a GPIO can run
+--
+--     pigeonmesh sos "Water over the embankment at Char Rajibpur"
+--
+-- and the warning reaches every phone on every node in the mesh, with no
+-- internet, no SMS gateway and no app install.
+
+package.path = "/usr/lib/lua/?.lua;/usr/lib/lua/?/init.lua;" .. package.path
+
+local nixio = require("nixio")
+local json  = require("pigeonmesh.json")
+local util  = require("pigeonmesh.util")
+
+local HOST = "127.0.0.1"
+local PORT = tonumber(util.uci_load("pigeonmesh", "main").http_port) or 8080
+
+-- ------------------------------------------------------------------
+-- Minimal blocking HTTP client
+-- ------------------------------------------------------------------
+
+local function request(method, path, body, timeout)
+    local s = nixio.socket("inet", "stream")
+    if not s then return nil, "no socket" end
+    s:setblocking(true)
+    s:setsockopt("socket", "sndtimeo", timeout or 5)
+    s:setsockopt("socket", "rcvtimeo", timeout or 5)
+    if not s:connect(HOST, PORT) then
+        s:close()
+        return nil, "pigeonmeshd is not answering on port " .. PORT
+    end
+    local req = string.format(
+        "%s %s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n", method, path)
+    if body then
+        req = req .. "Content-Type: application/json\r\nContent-Length: "
+            .. #body .. "\r\n\r\n" .. body
+    else
+        req = req .. "\r\n"
+    end
+    s:write(req)
+
+    local buf = {}
+    while true do
+        local chunk = s:read(16384)
+        if not chunk or #chunk == 0 then break end
+        buf[#buf + 1] = chunk
+    end
+    s:close()
+
+    local raw = table.concat(buf)
+    local head_end = raw:find("\r\n\r\n", 1, true)
+    if not head_end then return nil, "truncated response" end
+    return raw:sub(head_end + 4), nil, tonumber(raw:match("^HTTP/1.1 (%d+)"))
+end
+
+local function get_json(path)
+    local body, e = request("GET", path)
+    if not body then return nil, e end
+    return json.decode(body)
+end
+
+local function post_json(path, tbl)
+    local body, e = request("POST", path, json.encode(tbl))
+    if not body then return nil, e end
+    return json.decode(body)
+end
+
+-- ------------------------------------------------------------------
+-- Record construction
+--
+-- Records posted from the router carry no signature. The PWA renders them
+-- with a "node" badge rather than a verified-identity badge, which is
+-- honest: the router cannot prove who typed the command. What it can prove
+-- is which node it came from, and for a sensor that is exactly right.
+-- ------------------------------------------------------------------
+
+local function make_record(kind, body, nick)
+    return {
+        id = util.newid(),
+        kind = kind,
+        ts = util.now(),
+        chan = kind == "sos" and "sos" or "public",
+        nick = nick or (util.hostname() .. " (node)"),
+        author = "node:" .. util.node_id(),
+        origin = util.node_id(),
+        hops = 0,
+        body = body,
+    }
+end
+
+local function submit(rec)
+    local res, e = post_json("/api/records", { records = { rec } })
+    if not res then
+        io.stderr:write("error: " .. tostring(e) .. "\n")
+        return 1
+    end
+    if res.accepted and #res.accepted > 0 then
+        print("sent " .. rec.id:sub(1, 12) .. " (" .. rec.kind .. ")")
+        return 0
+    end
+    io.stderr:write("rejected: " .. json.encode(res.rejected or {}) .. "\n")
+    return 1
+end
+
+-- ------------------------------------------------------------------
+-- Formatting
+-- ------------------------------------------------------------------
+
+local function ago(ts)
+    local d = util.now() - (ts or 0)
+    if d < 0 then d = 0 end
+    if d < 60 then return d .. "s" end
+    if d < 3600 then return math.floor(d / 60) .. "m" end
+    if d < 86400 then return math.floor(d / 3600) .. "h" end
+    return math.floor(d / 86400) .. "d"
+end
+
+local function human_bytes(n)
+    n = n or 0
+    if n < 1024 then return n .. " B" end
+    if n < 1024 * 1024 then return string.format("%.1f KB", n / 1024) end
+    return string.format("%.1f MB", n / 1048576)
+end
+
+-- ------------------------------------------------------------------
+-- Commands
+-- ------------------------------------------------------------------
+
+local cmds = {}
+
+cmds.status = function()
+    local st, e = get_json("/api/state")
+    if not st then
+        io.stderr:write("error: " .. tostring(e) .. "\n")
+        return 1
+    end
+    local n = st.node
+    print(string.format("PigeonMesh %s  node %s (%s)", n.version, n.node, n.name))
+    print(string.format("  web        http://%s:%d/", n.lan, n.http_port))
+    print(string.format("  uptime     %s   load %.2f   free RAM %d KB",
+        ago(util.now() - n.uptime), n.load or 0, n.mem_free_kb or 0))
+    if n.battery then print(string.format("  battery    %d%%", n.battery)) end
+    if n.clock_derived then
+        print("  clock      derived from mesh (this node has no RTC/NTP)")
+    end
+    print(string.format("  store      %d records, %s of %s",
+        st.store.records, human_bytes(st.store.bytes), human_bytes(st.store.max_bytes)))
+    print(string.format("  browsers   %d connected (%d live streams)",
+        st.http.conns or 0, st.http.sse or 0))
+    print(string.format("  mesh       %d flooded, %d gossip rounds, carried in %d / out %d",
+        st.mesh.flooded, st.mesh.gossip_rounds, st.mesh.carried_in, st.mesh.carried_out))
+    print(string.format("  peers      %d", #st.peers))
+    for _, p in ipairs(st.peers) do
+        print(string.format("    %-10s %-16s %s%s", p.node, p.name or "?",
+            p.direct and ("direct " .. (p.addr or "")) or ("via mesh, " .. (p.hops or "?") .. " hops"),
+            p.rtt_ms and string.format("  rtt %dms", p.rtt_ms) or ""))
+    end
+    return 0
+end
+
+cmds.peers = function()
+    local t, e = get_json("/api/topology")
+    if not t then
+        io.stderr:write("error: " .. tostring(e) .. "\n")
+        return 1
+    end
+    for _, n in ipairs(t.nodes or {}) do
+        print(string.format("%-10s %-18s %s  records=%s%s",
+            n.node, n.name or "?",
+            n.self and "SELF" or ((n.hops or 1) .. " hop(s)"),
+            tostring(n.records or "?"),
+            n.battery and ("  batt=" .. n.battery .. "%") or ""))
+        if n.links and #n.links > 0 then
+            print("           links: " .. table.concat(n.links, ", "))
+        end
+    end
+    return 0
+end
+
+cmds.send = function(args)
+    local text = table.concat(args, " ")
+    if #text == 0 then
+        io.stderr:write("usage: pigeonmesh send <text>\n")
+        return 2
+    end
+    return submit(make_record("chat", { text = text:sub(1, 2000) }))
+end
+
+cmds.sos = function(args)
+    local text = table.concat(args, " ")
+    if #text == 0 then
+        io.stderr:write("usage: pigeonmesh sos <what is happening>\n")
+        return 2
+    end
+    return submit(make_record("sos", {
+        text = text:sub(1, 2000),
+        source = "node",
+        need = "unspecified",
+    }))
+end
+
+cmds.bulletin = function(args)
+    local text = table.concat(args, " ")
+    if #text == 0 then
+        io.stderr:write("usage: pigeonmesh bulletin <announcement>\n")
+        return 2
+    end
+    return submit(make_record("bulletin", { text = text:sub(1, 2000), title = "" }))
+end
+
+cmds.tail = function(args)
+    local n = tonumber(args[1]) or 20
+    local res, e = get_json("/api/records?since=0&limit=1000")
+    if not res then
+        io.stderr:write("error: " .. tostring(e) .. "\n")
+        return 1
+    end
+    local recs = res.records or {}
+    local start = math.max(1, #recs - n + 1)
+    for i = start, #recs do
+        local r = recs[i]
+        local text = (r.body and (r.body.text or r.body.title)) or ("<" .. r.kind .. ">")
+        print(string.format("%6s  %-8s %-14s %s", ago(r.ts), r.kind,
+            (r.nick or "?"):sub(1, 14), tostring(text):sub(1, 90)))
+    end
+    return 0
+end
+
+-- Follow the live stream. Uses the same SSE endpoint the browser does, so
+-- this doubles as a check that push actually works.
+cmds.watch = function()
+    local s = nixio.socket("inet", "stream")
+    s:setblocking(true)
+    if not s:connect(HOST, PORT) then
+        io.stderr:write("cannot connect to pigeonmeshd\n")
+        return 1
+    end
+    s:write("GET /api/stream HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n")
+    print("watching mesh (ctrl-c to stop)...")
+    local buf = ""
+    while true do
+        local chunk = s:read(4096)
+        if not chunk or #chunk == 0 then break end
+        buf = buf .. chunk
+        while true do
+            local nl = buf:find("\n")
+            if not nl then break end
+            local line = buf:sub(1, nl - 1)
+            buf = buf:sub(nl + 1)
+            local data = line:match("^data: (.*)$")
+            if data then
+                local r = json.decode(data)
+                if r and r.kind then
+                    local text = (r.body and (r.body.text or r.body.title)) or r.kind
+                    print(string.format("  %-8s %-14s %s", r.kind,
+                        (r.nick or "?"):sub(1, 14), tostring(text):sub(1, 90)))
+                end
+            end
+        end
+    end
+    s:close()
+    return 0
+end
+
+-- Point pigeon.mesh at this router and, optionally, make joining the Wi-Fi
+-- pop the app up by itself.
+cmds.domain = function(args)
+    local domain = args[1] or util.uci_load("pigeonmesh", "main").domain or "pigeon.mesh"
+    -- Read the live interface address rather than the UCI value: on OpenWrt
+    -- 25.x network.lan.ipaddr may carry a /24 suffix that dnsmasq rejects.
+    local ip = util.lan_address()
+    os.execute("uci -q delete dhcp.pigeonmesh >/dev/null 2>&1")
+    os.execute(string.format("uci set dhcp.pigeonmesh=domain; " ..
+        "uci set dhcp.pigeonmesh.name='%s'; " ..
+        "uci set dhcp.pigeonmesh.ip='%s'; " ..
+        "uci commit dhcp", domain, ip))
+    os.execute("/etc/init.d/dnsmasq reload >/dev/null 2>&1")
+    print(string.format("%s now resolves to %s on this router's DHCP clients", domain, ip))
+    print(string.format("open http://%s:%d/", domain, PORT))
+    return 0
+end
+
+-- Add a router this node should keep a link to, regardless of discovery.
+--
+-- Broadcast discovery only finds neighbours that share a broadcast domain
+-- and will accept inbound connections. Two common cases break that: a node
+-- joined to another node's Wi-Fi as a client (its uplink sits in the wan
+-- firewall zone, so inbound is dropped), and a directional or tunnelled
+-- link between two sites. In both cases one side dials out and the single
+-- TCP session then carries the mesh in both directions.
+cmds.link = function(args)
+    local target = args[1]
+    if not target then
+        io.stderr:write("usage: pigeonmesh link <ip[:port]>\n")
+        return 2
+    end
+    local existing = util.uci_load("pigeonmesh", "main").peers
+    local list = {}
+    if type(existing) == "table" then list = existing
+    elseif type(existing) == "string" then list = { existing } end
+    for _, p in ipairs(list) do
+        if p == target then
+            print(target .. " is already a configured peer")
+            return 0
+        end
+    end
+    os.execute("uci add_list pigeonmesh.main.peers='" .. target .. "' && uci commit pigeonmesh")
+    os.execute("/etc/init.d/pigeonmesh restart >/dev/null 2>&1")
+    print("linked to " .. target .. "; restarting node")
+    return 0
+end
+
+cmds.unlink = function(args)
+    local target = args[1]
+    if not target then
+        io.stderr:write("usage: pigeonmesh unlink <ip[:port]>\n")
+        return 2
+    end
+    os.execute("uci del_list pigeonmesh.main.peers='" .. target .. "' && uci commit pigeonmesh")
+    os.execute("/etc/init.d/pigeonmesh restart >/dev/null 2>&1")
+    print("unlinked " .. target)
+    return 0
+end
+
+cmds.wipe = function(args)
+    -- Deliberately requires the word, not a -y flag. This destroys the
+    -- node's copy of every record, which in a protest context is the point.
+    if args[1] ~= "CONFIRM" then
+        print("This erases every record held by this node, on disk and in RAM.")
+        print("")
+        print("It does NOT erase the mesh. Other nodes keep their copies, and")
+        print("any phone that has been carrying records will hand them back to")
+        print("this node the next time it connects. To remove something from")
+        print("the mesh you must wipe every node AND every phone holding it.")
+        print("")
+        print("Run: pigeonmesh wipe CONFIRM")
+        return 2
+    end
+    os.execute("/etc/init.d/pigeonmesh stop >/dev/null 2>&1")
+    local cfg = util.uci_load("pigeonmesh", "main")
+    os.execute("rm -f '" .. (cfg.hot_path or "/var/lib/pigeonmesh/records.jsonl") .. "'")
+    os.execute("rm -f '" .. (cfg.checkpoint_path or "/etc/pigeonmesh/store/records.jsonl") .. "'")
+    os.execute("/etc/init.d/pigeonmesh start >/dev/null 2>&1")
+    print("wiped.")
+    return 0
+end
+
+cmds.help = function()
+    print([[
+pigeonmesh -- crisis mesh node control
+
+  pigeonmesh status              node health, peers, storage
+  pigeonmesh peers               every node the mesh knows about
+  pigeonmesh tail [n]            last n records
+  pigeonmesh watch               follow records live
+  pigeonmesh send <text>         post a chat message from this node
+  pigeonmesh sos <text>          post a priority alert (for sensors/scripts)
+  pigeonmesh bulletin <text>     post an announcement
+  pigeonmesh link <ip[:port]>    keep a link to a router discovery cannot find
+  pigeonmesh unlink <ip[:port]>  drop that link
+  pigeonmesh domain [name]       point pigeon.mesh at this router
+  pigeonmesh wipe CONFIRM        erase every record held by this node
+]])
+    return 0
+end
+
+local cmd = arg[1] or "status"
+local rest = {}
+for i = 2, #arg do rest[#rest + 1] = arg[i] end
+
+local fn = cmds[cmd]
+if not fn then
+    io.stderr:write("unknown command: " .. cmd .. "\n")
+    cmds.help()
+    os.exit(2)
+end
+os.exit(fn(rest) or 0)
