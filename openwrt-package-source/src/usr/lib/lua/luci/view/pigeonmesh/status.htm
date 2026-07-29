@@ -3,6 +3,13 @@
 
  The port comes from UCI rather than a literal, so this page keeps working
  after someone changes it under Settings.
+
+ The scheme is hardcoded to http. The daemon has no TLS -- there is no
+ certificate authority to reach when the internet is down -- so following
+ location.protocol would produce an https URL that can never answer whenever
+ an admin reached LuCI over https. That also means the browser blocks the
+ request as mixed content in exactly that case, so there is nothing to fetch
+ inline and the page says so rather than spinning on "Loading...".
 -%>
 <%
 local uci = luci.model.uci.cursor()
@@ -17,9 +24,21 @@ local alias = uci:get("pigeonmesh", "main", "alias_ip") or ""
 (function(){
     var host = location.hostname;
     if (host.indexOf(':') >= 0 && host.charAt(0) !== '[') host = '[' + host + ']';
-    var API = location.protocol + '//' + host + ':<%=port%>/api';
+    // Always http: the daemon speaks no TLS. See the note at the top.
+    var BASE = 'http://' + host + ':<%=port%>';
+    var API = BASE + '/api';
     var ALIAS = '<%=alias%>';
     var box = document.getElementById('pm-status');
+
+    if (location.protocol === 'https:') {
+        box.innerHTML =
+            '<p style="color:#f59e0b;margin:0 0 .5rem">' +
+            'This page is loaded over HTTPS, and the PigeonMesh daemon serves plain HTTP, ' +
+            'so the browser will not let this page read it.</p>' +
+            '<p style="margin:0">Open <a style="color:#7dd3fc" href="' + BASE + '/">' +
+            BASE + '/</a> directly, or reach LuCI over http to see status inline.</p>';
+        return;
+    }
 
     function esc(s) {
         return String(s == null ? '' : s).replace(/[&<>"]/g, function(c) {
@@ -36,7 +55,7 @@ local alias = uci:get("pigeonmesh", "main", "alias_ip") or ""
             h += '\n  uptime:  ' + esc(d.node.uptime) + 's';
             h += '\n  app:     http://' + esc('<%=domain%>') + '/';
             if (ALIAS) h += '  (' + esc(ALIAS) + ':80)';
-            h += '\n           ' + API.replace(/\/api$/, '/');
+            h += '\n           ' + BASE + '/';
             h += '</pre>';
         }
         if (d.store) {

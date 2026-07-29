@@ -83,8 +83,10 @@ rm -f "$STAGE/www/pigeonmesh/selftest.html"
 sed -i "s/^local VERSION = \".*\"/local VERSION = \"$PKG_VERSION\"/" \
 	"$STAGE/usr/sbin/pigeonmeshd"
 
-INSTALLED_SIZE=$(du -sb "$STAGE" 2>/dev/null | cut -f1 || echo 0)
-say "$(find "$STAGE" -type f | wc -l) files, $INSTALLED_SIZE bytes"
+# du -sk, not -sb: -b is GNU-only and this has to run on a BSD userland too.
+# The exact figure the .ipk records is computed further down, the way OpenWrt
+# computes it.
+say "$(find "$STAGE" -type f | wc -l) files, $(du -sk "$STAGE" | cut -f1) KiB"
 
 # ---------------------------------------------------------------- tarball
 echo "==> tar.gz"
@@ -97,6 +99,17 @@ echo "==> ipk"
 if command -v ar >/dev/null 2>&1; then
 	ipktmp="$STAGE.ipk"
 	rm -rf "$ipktmp"; mkdir -p "$ipktmp/control"
+
+	# Payload first, because Installed-Size is derived from it.
+	tar czf "$ipktmp/data.tar.gz" -C "$STAGE" .
+
+	# Installed-Size is in BYTES here, not KiB. That is Debian's convention but
+	# not OpenWrt's: scripts/ipkg-build in the OpenWrt tree sets it from
+	# `zcat data.tar.gz | wc -c`, and opkg reads it back the same way. Matching
+	# upstream exactly -- including the tar headers and padding that a `du` of
+	# the staging tree would miss -- keeps this package consistent with every
+	# other package on the router. Writing KiB here would understate it 1024x.
+	INSTALLED_SIZE=$(gzip -dc "$ipktmp/data.tar.gz" | wc -c | tr -d ' ')
 
 	cat > "$ipktmp/control/control" <<EOF
 Package: $PKG_NAME
@@ -119,7 +132,6 @@ EOF
 
 	echo "2.0" > "$ipktmp/debian-binary"
 	tar czf "$ipktmp/control.tar.gz" -C "$ipktmp/control" .
-	tar czf "$ipktmp/data.tar.gz" -C "$STAGE" .
 	( cd "$ipktmp" && ar r "$DIST/${PKG_NAME}_${FULLVER}_all.ipk" \
 		debian-binary control.tar.gz data.tar.gz 2>/dev/null )
 	rm -rf "$ipktmp"
