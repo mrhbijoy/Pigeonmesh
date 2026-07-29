@@ -39,11 +39,15 @@ LAN_IP=$(uci -q get network.lan.ipaddr | cut -d/ -f1)
 [ -z "$LAN_IP" ] && LAN_IP=$(ip -4 -o addr show br-lan 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
 
 if [ -n "$LAN_IP" ]; then
-	uci -q delete dhcp.pigeonmesh
-	uci set dhcp.pigeonmesh=domain
-	uci set dhcp.pigeonmesh.name="$PM_DOMAIN"
-	uci set dhcp.pigeonmesh.ip="$LAN_IP"
+	uci del_list dhcp.@dnsmasq[0].address="/$PM_DOMAIN/$LAN_IP" 2>/dev/null
+	uci add_list dhcp.@dnsmasq[0].address="/$PM_DOMAIN/$LAN_IP"
+	uci del_list dhcp.@dnsmasq[0].rebind_domain="$PM_DOMAIN" 2>/dev/null
+	uci add_list dhcp.@dnsmasq[0].rebind_domain="$PM_DOMAIN"
 	uci commit dhcp
+
+	if ! grep -q "$PM_DOMAIN" /etc/hosts; then
+		echo "$LAN_IP $PM_DOMAIN" >> /etc/hosts
+	fi
 fi
 
 # Set up uhttpd /www/index.html with host header redirection:
