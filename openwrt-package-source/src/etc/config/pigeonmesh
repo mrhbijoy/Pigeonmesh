@@ -9,7 +9,7 @@ config pigeonmesh 'main'
 	option disc_port '7101'
 
 	# The app and its API. uhttpd keeps port 80 and LuCI keeps working.
-	option http_port '8080'
+	option http_port '3607'
 	option http_addr '0.0.0.0'
 	option docroot '/www/pigeonmesh'
 

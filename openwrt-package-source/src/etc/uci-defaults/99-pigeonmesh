@@ -9,7 +9,7 @@
 
 PM_PEER_PORT=$(uci -q get pigeonmesh.main.peer_port || echo 7100)
 PM_DISC_PORT=$(uci -q get pigeonmesh.main.disc_port || echo 7101)
-PM_HTTP_PORT=$(uci -q get pigeonmesh.main.http_port || echo 8080)
+PM_HTTP_PORT=$(uci -q get pigeonmesh.main.http_port || echo 3607)
 PM_DOMAIN=$(uci -q get pigeonmesh.main.domain || echo pigeon.mesh)
 
 # ---------------------------------------------------------------- firewall
@@ -31,7 +31,7 @@ add_rule pigeonmesh_disc udp "$PM_DISC_PORT" "PigeonMesh discovery"
 add_rule pigeonmesh_http tcp "$PM_HTTP_PORT" "PigeonMesh app"
 uci commit firewall
 
-# ---------------------------------------------------------------- dns
+# ---------------------------------------------------------------- dns & index redirect
 # Give the app a name people can type from memory and read off a wall.
 # On OpenWrt 25.x network.lan.ipaddr can carry a prefix ("192.168.3.1/24").
 # Feeding that to dnsmasq silently breaks name resolution, so strip it.
@@ -46,6 +46,37 @@ if [ -n "$LAN_IP" ]; then
 	uci commit dhcp
 fi
 
+# Set up uhttpd /www/index.html with host header redirection:
+# pigeon.mesh -> :3607, IP / others -> /cgi-bin/luci
+cat > /www/index.html <<'INDEXEOF'
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>OpenWrt / PigeonMesh</title>
+<script>
+(function() {
+  var h = window.location.hostname;
+  if (h === 'pigeon.mesh' || h.indexOf('pigeon.mesh') !== -1) {
+    window.location.replace(window.location.protocol + '//' + h + ':3607' + window.location.pathname + window.location.search + window.location.hash);
+  } else {
+    window.location.replace('/cgi-bin/luci');
+  }
+})();
+</script>
+</head>
+<body>
+Redirecting...
+</body>
+</html>
+INDEXEOF
+
+# Ensure uhttpd serves index.html by default
+if uci -q get uhttpd.main >/dev/null; then
+	uci set uhttpd.main.index_page='index.html'
+	uci commit uhttpd
+fi
+
 # ---------------------------------------------------------------- apply
 # uci-defaults also runs during image build, where no services exist yet.
 if [ -d /var/run ] && [ -x /etc/init.d/firewall ]; then
@@ -53,6 +84,9 @@ if [ -d /var/run ] && [ -x /etc/init.d/firewall ]; then
 fi
 if [ -d /var/run ] && [ -x /etc/init.d/dnsmasq ]; then
 	/etc/init.d/dnsmasq reload >/dev/null 2>&1
+fi
+if [ -d /var/run ] && [ -x /etc/init.d/uhttpd ]; then
+	/etc/init.d/uhttpd reload >/dev/null 2>&1
 fi
 
 exit 0
