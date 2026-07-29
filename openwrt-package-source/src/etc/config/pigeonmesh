@@ -40,6 +40,7 @@ config pigeonmesh 'main'
 	# 0 = errors only, 1 = normal, 2 = verbose
 	option log_level '1'
 
-	# Routers that cannot hear each other's broadcasts -- a directional
-	# link, a VPN, a different subnet -- go here as "ip" or "ip:port".
-	# list peers '192.168.2.1'
+config pigeonmesh 'bridge'
+	option url ''
+	option interval '30'
+
