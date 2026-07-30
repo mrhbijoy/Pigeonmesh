@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="images/logo.png" width="200" alt="PigeonMesh Logo" />
+</p>
+
 # PigeonMesh
 
 **Communication that survives a shutdown.**
