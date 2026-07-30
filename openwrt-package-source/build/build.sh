@@ -70,8 +70,8 @@ cp -r "$SRC/." "$STAGE/"
 chown -R 0:0 "$STAGE" 2>/dev/null || true
 find "$STAGE" -type d -exec chmod 0755 {} +
 find "$STAGE" -type f -exec chmod 0644 {} +
-for x in usr/sbin/pigeonmeshd usr/bin/pigeonmesh etc/init.d/pigeonmesh \
-         etc/uci-defaults/99-pigeonmesh; do
+for x in usr/sbin/pigeonmeshd usr/bin/pigeonmesh usr/bin/pm-bridge-sync.sh etc/init.d/pigeonmesh \
+         etc/init.d/pm-bridge-sync etc/uci-defaults/99-pigeonmesh; do
 	[ -f "$STAGE/$x" ] && chmod 0755 "$STAGE/$x"
 done
 
