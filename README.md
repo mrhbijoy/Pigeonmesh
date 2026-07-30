@@ -23,6 +23,10 @@ kept people connected during the internet shutdowns of the July Revolution.
 
 ## The five-minute version
 
+<p align="center">
+  <img src="images/how-it-works.png" width="800" alt="PigeonMesh System Architecture & Store-and-Forward Concept Diagram" />
+</p>
+
 A flood cuts a district in half. The mobile towers go dark. People are stranded
 on rooftops. In the old world, they wait.
 
