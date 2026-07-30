@@ -2,9 +2,7 @@
 pigeonmesh-apk/
 pigeonmesh-disaster-kit/
 
-# Build output. Packages are produced by openwrt-package-source/build/build.sh
-# and attached to releases rather than committed.
-dist/
+# Build output packages in dist/ tracked for distribution
 
 # Note: there is deliberately no bare "build/" rule here.
 # openwrt-package-source/build/ holds build.sh and the maintainer scripts --

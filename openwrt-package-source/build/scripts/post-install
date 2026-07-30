@@ -11,4 +11,8 @@ mkdir -p /var/lib/pigeonmesh /etc/pigeonmesh/store
 /etc/init.d/pigeonmesh enable
 /etc/init.d/pigeonmesh restart
 
+# Clear LuCI cache and reload uhttpd so LuCI menus appear immediately
+rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* 2>/dev/null || true
+[ -x /etc/init.d/uhttpd ] && /etc/init.d/uhttpd restart >/dev/null 2>&1 || true
+
 exit 0
