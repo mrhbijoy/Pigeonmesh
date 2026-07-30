@@ -23,11 +23,22 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
 export async function GET(req: NextRequest) {
-  const path = req.nextUrl.pathname.replace(/^\/api\/pigeonmesh\/?/, "");
+  const rawPath = req.nextUrl.pathname.replace(/^\/api\/pigeonmesh\/?/, "");
+  const path = rawPath.split("/").filter(Boolean).pop() || "";
 
   try {
     if (path === "health" || path === "") {
       return NextResponse.json({ ok: true, node: NODE_ID, time: Math.floor(Date.now() / 1000) });
+    }
+
+    if (path === "sync") {
+      return NextResponse.json({
+        ok: true,
+        node: NODE_ID,
+        endpoint: "sync",
+        message: "Send a POST request with router records to sync with the bridge.",
+        time: Math.floor(Date.now() / 1000)
+      });
     }
 
     if (path === "state") {
@@ -68,7 +79,8 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
-  const path = req.nextUrl.pathname.replace(/^\/api\/pigeonmesh\/?/, "");
+  const rawPath = req.nextUrl.pathname.replace(/^\/api\/pigeonmesh\/?/, "");
+  const path = rawPath.split("/").filter(Boolean).pop() || "";
   const peer = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "anon";
   gcBuckets();
 

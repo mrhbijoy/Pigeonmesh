@@ -31,7 +31,7 @@ if [ -n "$BRIDGE_URL" ]; then
 
     cat > /usr/bin/pm-bridge-sync.sh <<'BRIDGESCRIPT'
 #!/bin/sh
-BRIDGE_URL=$(uci -q get pigeonmesh.bridge.url)
+BRIDGE_URL=$(uci -q get pigeonmesh.bridge.url | sed 's|/api/pigeonmesh.*||; s|/*$||')
 INTERVAL=$(uci -q get pigeonmesh.bridge.interval || echo '30')
 LOCAL="http://127.0.0.1:3607"
 [ -z "$BRIDGE_URL" ] && exit 0
