@@ -191,6 +191,16 @@ Dark by default, Bangla by default, built for a phone held in one hand at night
 by someone who is frightened. Touch targets are never smaller than 44 px, there
 are no web fonts to fail to load, and the whole thing is about 110 KB.
 
+<p align="center">
+  <img src="images/Screenshot%202026-07-30%20205738.png" width="240" alt="Chat Interface" />
+  <img src="images/Screenshot%202026-07-30%20205807.png" width="240" alt="SOS Emergency Alert" />
+  <img src="images/Screenshot%202026-07-30%20205836.png" width="240" alt="Missing Persons & Check-ins" />
+</p>
+<p align="center">
+  <img src="images/Screenshot%202026-07-30%20205926.png" width="240" alt="Offline OpenStreetMap" />
+  <img src="images/Screenshot%202026-07-30%20210015.png" width="240" alt="Mesh Node Status" />
+</p>
+
 - **Chat** — public, relief and medical channels.
 - **SOS** — hold to send, so a pocket press cannot fire it. What is happening,
   what you need, and your location if you allow it.
@@ -224,6 +234,10 @@ instead — that path never depends on the browser granting anything.
 ## LuCI
 
 **Services → PigeonMesh**, once LuCI is installed:
+
+<p align="center">
+  <img src="images/image.png" width="700" alt="LuCI Admin Status Interface" />
+</p>
 
 | Page | What |
 |---|---|
