@@ -41,7 +41,7 @@ define Package/pigeonmesh
   SUBMENU:=Communication
   TITLE:=Crisis mesh: chat, SOS and relief coordination without internet
   URL:=https://github.com/pigeonmesh/pigeonmesh
-  DEPENDS:=+lua +luci-lib-nixio
+  DEPENDS:=+lua +luci-lib-nixio +luci-compat
   PKGARCH:=all
 endef
 

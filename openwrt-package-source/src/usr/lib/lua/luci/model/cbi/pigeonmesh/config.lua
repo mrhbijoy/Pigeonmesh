@@ -3,6 +3,14 @@
 local m = Map("pigeonmesh", "PigeonMesh Settings",
     "After changing settings, click Save & Apply — the daemon restarts automatically.")
 
+-- Ensure bridge section exists in UCI if upgrading from an older config
+if not m.uci:get("pigeonmesh", "bridge") then
+    m.uci:section("pigeonmesh", "pigeonmesh", "bridge", {
+        url = "",
+        interval = "30"
+    })
+end
+
 local s = m:section(NamedSection, "main", "pigeonmesh", "Daemon")
 s.addremove = false
 

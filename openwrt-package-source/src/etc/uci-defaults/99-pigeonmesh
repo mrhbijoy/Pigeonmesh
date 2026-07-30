@@ -59,6 +59,10 @@ if [ -n "$PM_ALIAS_IP" ]; then
 	uci commit network
 
 	uci set pigeonmesh.main.alias_ip="$PM_ALIAS_IP"
+	if ! uci -q get pigeonmesh.bridge >/dev/null; then
+		uci set pigeonmesh.bridge=pigeonmesh
+		uci set pigeonmesh.bridge.interval='30'
+	fi
 	uci commit pigeonmesh
 
 	# A network that belongs to no firewall zone falls through to the INPUT

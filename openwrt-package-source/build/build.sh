@@ -27,7 +27,7 @@ PKG_RELEASE=${PKG_RELEASE:-1}
 PKG_LICENSE="GPL-2.0-only"
 PKG_URL="https://github.com/pigeonmesh/pigeonmesh"
 PKG_DESC="Crisis mesh: offline chat, SOS, safe check-in, missing persons and relief mapping"
-PKG_DEPENDS="lua luci-lib-nixio"
+PKG_DEPENDS="lua luci-lib-nixio luci-compat"
 
 FULLVER="${PKG_VERSION}-r${PKG_RELEASE}"
 
