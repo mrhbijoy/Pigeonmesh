@@ -18,7 +18,9 @@
  *   /api/*      network-only, never cached (stale mesh state is dangerous)
  */
 
-const VERSION = 'pigeonmesh-v1';
+// Bump on every shell change. The shell is served cache-first, so a stale
+// version here is a phone running last week's app.
+const VERSION = 'pigeonmesh-v2';
 const SHELL = [
   './',
   'index.html',

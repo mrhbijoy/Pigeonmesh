@@ -269,18 +269,57 @@ end
 -- Point pigeon.mesh at this router and, optionally, make joining the Wi-Fi
 -- pop the app up by itself.
 cmds.domain = function(args)
-    local domain = args[1] or util.uci_load("pigeonmesh", "main").domain or "pigeon.mesh"
-    -- Read the live interface address rather than the UCI value: on OpenWrt
-    -- 25.x network.lan.ipaddr may carry a /24 suffix that dnsmasq rejects.
-    local ip = util.lan_address()
+    local cfg = util.uci_load("pigeonmesh", "main")
+    local domain = args[1] or cfg.domain or "pigeon.mesh"
+
+    -- Point the name at the address PigeonMesh owns, not at the router's own
+    -- address. They are deliberately different: the router's address is
+    -- uhttpd and LuCI, and sending pigeon.mesh there is what used to land
+    -- people on the admin login instead of the app.
+    --
+    -- Falls back to the LAN address when no alias is configured, in which
+    -- case the app answers on its own port rather than on 80. Read the live
+    -- interface address rather than the UCI value: on OpenWrt 25.x
+    -- network.lan.ipaddr may carry a /24 suffix that dnsmasq rejects.
+    local alias = cfg.alias_ip
+    local alias_port = tonumber(cfg.alias_port) or 80
+    local ip = (alias and #alias > 0) and alias or util.lan_address()
+    local on_alias = (alias and #alias > 0)
+
+    -- Clear every form this has been written in, then write the current one.
+    --
+    -- "address=" is authoritative on its own. Never write
+    -- dhcp.@dnsmasq[0].local: OpenWrt renders it as a single option, so a
+    -- second value becomes "local=/lan/ /pigeon.mesh/" on one line and
+    -- dnsmasq refuses to start -- taking DNS and DHCP down with it.
     os.execute("uci -q delete dhcp.pigeonmesh >/dev/null 2>&1")
-    os.execute(string.format("uci set dhcp.pigeonmesh=domain; " ..
-        "uci set dhcp.pigeonmesh.name='%s'; " ..
-        "uci set dhcp.pigeonmesh.ip='%s'; " ..
-        "uci commit dhcp", domain, ip))
+    os.execute(string.format(
+        "for old in $(uci -q get dhcp.@dnsmasq[0].address); do " ..
+        "  case \"$old\" in /%s/*) uci -q del_list dhcp.@dnsmasq[0].address=\"$old\";; esac; " ..
+        "done; " ..
+        "while uci -q get dhcp.@dnsmasq[0].rebind_domain | grep -q '%s'; do " ..
+        "  uci -q del_list dhcp.@dnsmasq[0].rebind_domain='%s' || break; " ..
+        "done; " ..
+        "case \" $(uci -q get dhcp.@dnsmasq[0].local) \" in " ..
+        "  *\" /%s/ \"*) uci -q delete dhcp.@dnsmasq[0].local; " ..
+        "             uci set dhcp.@dnsmasq[0].local='/lan/';; esac; " ..
+        "uci add_list dhcp.@dnsmasq[0].address='/%s/%s'; " ..
+        "uci add_list dhcp.@dnsmasq[0].rebind_domain='%s'; " ..
+        "uci commit dhcp",
+        domain, domain, domain, domain, domain, ip, domain))
+
+    os.execute(string.format(
+        "sed -i '/[[:space:]]%s$/d' /etc/hosts 2>/dev/null; echo '%s %s' >> /etc/hosts",
+        domain, ip, domain))
+
     os.execute("/etc/init.d/dnsmasq reload >/dev/null 2>&1")
-    print(string.format("%s now resolves to %s on this router's DHCP clients", domain, ip))
-    print(string.format("open http://%s:%d/", domain, PORT))
+
+    print(string.format("%s now resolves to %s for this router's DHCP clients", domain, ip))
+    if on_alias and alias_port == 80 then
+        print(string.format("open http://%s/", domain))
+    else
+        print(string.format("open http://%s:%d/", domain, on_alias and alias_port or PORT))
+    end
     return 0
 end
 

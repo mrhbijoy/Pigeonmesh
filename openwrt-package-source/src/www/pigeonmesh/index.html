@@ -6,6 +6,20 @@
 <meta name="theme-color" content="#0b1220">
 <meta name="description" content="PigeonMesh — crisis communication that works with no internet.">
 <title>PigeonMesh</title>
+<script>
+// The same files are served two ways: from a router at / and from the cloud
+// bridge under /pwa/. Setting <base> here keeps every relative URL -- assets,
+// the manifest, the service worker scope -- correct in both without keeping
+// two copies of the markup in sync by hand.
+(function() {
+  var p = window.location.pathname;
+  if (p.indexOf('/pwa/') === 0 || (p.indexOf('/pwa') === 0 && p.length === 4)) {
+    var b = document.createElement('base');
+    b.href = '/pwa/';
+    document.head.appendChild(b);
+  }
+})();
+</script>
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
@@ -48,7 +62,7 @@
     <button id="link-pill" class="pill" aria-live="polite">
       <span class="dot"></span><span id="link-text"></span>
     </button>
-    <button id="lang-toggle" class="pill pill-ghost" aria-label="Language">বাং/EN</button>
+    <button id="lang-toggle" class="pill pill-ghost" data-ta="language"></button>
   </header>
 
   <div id="clock-warn" class="banner banner-warn hidden" data-t="clock_warning"></div>
@@ -62,7 +76,7 @@
       <div class="scroll" id="chat-list"></div>
       <form class="composer" id="chat-form" autocomplete="off">
         <input id="chat-input" type="text" maxlength="900" enterkeyhint="send">
-        <button class="btn btn-primary" type="submit" aria-label="send">
+        <button class="btn btn-primary" type="submit" data-ta="send">
           <svg viewBox="0 0 24 24" width="22" height="22"><path d="M2 21l21-9L2 3v7l15 2-15 2z" fill="currentColor"/></svg>
         </button>
       </form>
@@ -151,8 +165,14 @@
     <section class="view" id="view-map">
       <div class="map-wrap">
         <canvas id="map-canvas"></canvas>
+        <div class="map-zoom">
+          <button id="map-in" class="zbtn" data-ta="zoom_in">+</button>
+          <button id="map-out" class="zbtn" data-ta="zoom_out">&minus;</button>
+        </div>
+        <div class="map-note hidden" id="map-note"></div>
         <div class="map-tools">
           <button id="map-locate" class="btn btn-ghost btn-sm" data-t="use_my_location"></button>
+          <button id="map-save" class="btn btn-ghost btn-sm" data-t="save_area"></button>
           <button id="map-add" class="btn btn-primary btn-sm" data-t="add_pin"></button>
         </div>
         <div class="map-legend" id="map-legend"></div>

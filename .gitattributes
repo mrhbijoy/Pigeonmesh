@@ -1,0 +1,31 @@
+# Everything in this repository that ends up on a router has to be LF.
+#
+# OpenWrt runs BusyBox ash. A script whose shebang line ends "\r" fails with
+# "/bin/sh^M: not found", and build/build.sh copies straight out of the working
+# tree -- so a clone on Windows with core.autocrlf=true would otherwise produce
+# a package that cannot start on the target.
+
+* text=auto eol=lf
+
+# Router payload: shell, Lua, and the app. Never CRLF.
+openwrt-package-source/src/**            text eol=lf
+openwrt-package-source/build/**          text eol=lf
+openwrt-package-source/openwrt-feed/**   text eol=lf
+*.lua                                    text eol=lf
+*.sh                                     text eol=lf
+*.htm                                    text eol=lf
+
+# These have no extension but are scripts.
+openwrt-package-source/src/etc/init.d/pigeonmesh          text eol=lf
+openwrt-package-source/src/etc/uci-defaults/99-pigeonmesh text eol=lf
+openwrt-package-source/src/etc/config/pigeonmesh          text eol=lf
+openwrt-package-source/src/usr/sbin/pigeonmeshd           text eol=lf
+openwrt-package-source/src/usr/bin/pigeonmesh             text eol=lf
+openwrt-package-source/build/scripts/post-install         text eol=lf
+openwrt-package-source/build/scripts/pre-deinstall        text eol=lf
+
+# Binary assets
+*.png binary
+*.apk binary
+*.ipk binary
+*.tar.gz binary

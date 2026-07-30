@@ -50,8 +50,9 @@ const API = ''; // same origin as the page
 /* ---------------------------------------------------------------- storage
  *
  * IndexedDB rather than localStorage: a missing-person report carries a
- * thumbnail, and localStorage's ~5 MB ceiling is both small and synchronous.
- * The wrapper is deliberately tiny -- one store, key = record id.
+ * thumbnail, map tiles are binary, and localStorage's ~5 MB ceiling is both
+ * small and synchronous. Three stores: records keyed by record id, tiles
+ * keyed by "z/x/y", and a scratch store for sync bookkeeping.
  */
 
 const DB = (() => {
@@ -60,7 +61,7 @@ const DB = (() => {
   function open() {
     if (dbp) return dbp;
     dbp = new Promise((resolve, reject) => {
-      const req = indexedDB.open('pigeonmesh', 1);
+      const req = indexedDB.open('pigeonmesh', 2);
       req.onupgradeneeded = () => {
         const db = req.result;
         if (!db.objectStoreNames.contains('records')) {
@@ -68,6 +69,9 @@ const DB = (() => {
         }
         if (!db.objectStoreNames.contains('meta')) {
           db.createObjectStore('meta');
+        }
+        if (!db.objectStoreNames.contains('tiles')) {
+          db.createObjectStore('tiles');
         }
       };
       req.onsuccess = () => resolve(req.result);
@@ -83,7 +87,12 @@ const DB = (() => {
       const s = t.objectStore(store);
       let out;
       try { out = fn(s); } catch (e) { reject(e); return; }
-      t.oncomplete = () => resolve(out && out.result !== undefined ? out.result : out);
+      // fn either returns an IDBRequest or nothing. Unwrap a request by
+      // reading .result, and decide that by whether it *is* a request rather
+      // than by whether the result is undefined: a miss has an undefined
+      // result, and handing back the request object instead makes every miss
+      // look like a hit to the caller.
+      t.oncomplete = () => resolve(out instanceof IDBRequest ? out.result : out);
       t.onerror = () => reject(t.error);
     });
   }
@@ -94,9 +103,15 @@ const DB = (() => {
     deleteAll: async () => {
       await tx('records', 'readwrite', (s) => s.clear());
       await tx('meta', 'readwrite', (s) => s.clear());
+      // Which areas someone downloaded a map for says where they have been
+      // or where they were going. A wipe that leaves that behind is not one.
+      await tx('tiles', 'readwrite', (s) => s.clear());
     },
     setMeta: (k, v) => tx('meta', 'readwrite', (s) => s.put(v, k)),
     getMeta: (k) => tx('meta', 'readonly', (s) => s.get(k)),
+    putTile: (k, blob) => tx('tiles', 'readwrite', (s) => { s.put(blob, k); }),
+    getTile: (k) => tx('tiles', 'readonly', (s) => s.get(k)),
+    countTiles: () => tx('tiles', 'readonly', (s) => s.count()),
   };
 })();
 
@@ -120,6 +135,20 @@ function timeAgo(ts) {
   if (d < 3600) return num(Math.floor(d / 60)) + ' ' + t('ago_m');
   if (d < 86400) return num(Math.floor(d / 3600)) + ' ' + t('ago_h');
   return num(Math.floor(d / 86400)) + ' ' + t('ago_d');
+}
+
+// Numbers and their units both go through the language, so a Bangla screen
+// never reads "১২০ m". Everything user-facing formats through these.
+function distance(m) {
+  return m >= 1000
+    ? num((m / 1000).toFixed(m >= 10000 ? 0 : 1)) + ' ' + t('unit_km')
+    : num(Math.round(m)) + ' ' + t('unit_m');
+}
+
+function bytesShort(b) {
+  return b >= 1048576
+    ? num((b / 1048576).toFixed(1)) + ' ' + t('unit_mb')
+    : num(Math.round(b / 1024)) + ' ' + t('unit_kb');
 }
 
 let toastTimer = null;
@@ -607,17 +636,211 @@ function renderPeople() {
 
 /* map -------------------------------------------------------------------
  *
- * There are no map tiles. A crisis node cannot download OpenStreetMap and
- * an 8 MB router cannot store it. What people actually need in the first
- * hours is relative geography -- where the shelter is compared to where I
- * am -- so this draws pins on a metric grid centred on the user, with a
- * scale bar. It is a sketch map, and it is honest about being one.
+ * Two layers, in order of preference.
+ *
+ *   1. Real OpenStreetMap tiles. A phone often still has mobile data when
+ *      the router's uplink is gone, so tiles are fetched when they can be
+ *      and kept in IndexedDB, which means a map looked at once stays usable
+ *      after the data stops. "Save this area" pulls the surrounding tiles
+ *      deliberately -- the thing to do before walking somewhere with no
+ *      signal.
+ *
+ *   2. A metric grid. Nothing cached and no network: fall back to drawing
+ *      relative geography with a scale bar. Less useful than a map, far
+ *      more useful than a blank rectangle.
+ *
+ * There is no map library. The whole point is that a 6 MB router serves
+ * this and a phone runs it with the radio off, so it is one canvas, the
+ * standard slippy-map projection, and about two hundred lines.
  */
 
 const PIN_KINDS = {
   shelter: '#4d8bff', water: '#22d3ee', medical: '#f472b6',
   food: '#facc15', danger: '#ff3b47', blocked: '#fb923c', boat: '#a78bfa',
 };
+
+const TILE_PX = 256;
+const TILE_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+const MIN_ZOOM = 3, MAX_ZOOM = 18;
+
+// Where the map opens when there is nothing else to go on: no pins, no GPS.
+// Somewhere is a better starting point than nowhere, because a map you can
+// drag is a map you can use; a blank one is not.
+const HOME = { lat: 23.8103, lon: 90.4125 };
+
+/* Web Mercator, in tile units. One unit = one tile at that zoom. */
+function lonToX(lon, z) { return ((lon + 180) / 360) * Math.pow(2, z); }
+function latToY(lat, z) {
+  const r = Math.max(-85.05, Math.min(85.05, lat)) * Math.PI / 180;
+  return ((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2) * Math.pow(2, z);
+}
+function xToLon(x, z) { return (x / Math.pow(2, z)) * 360 - 180; }
+function yToLat(y, z) {
+  const n = Math.PI - (2 * Math.PI * y) / Math.pow(2, z);
+  return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+}
+function metresPerPixel(lat, z) {
+  return (156543.03392 * Math.cos(lat * Math.PI / 180)) / Math.pow(2, z);
+}
+
+const Tiles = (() => {
+  const mem = new Map();      // "z/x/y" -> decoded image
+  const inflight = new Set();
+  const failed = new Map();   // key -> when it failed, so it can be retried
+  const RETRY_MS = 30000;
+  let redrawTimer = null;
+
+  const key = (z, x, y) => z + '/' + x + '/' + y;
+
+  function scheduleRedraw() {
+    if (redrawTimer) return;
+    redrawTimer = setTimeout(() => {
+      redrawTimer = null;
+      if (S.view === 'map') renderMap();
+    }, 60);
+  }
+
+  function decode(blob) {
+    if (window.createImageBitmap) return createImageBitmap(blob);
+    return new Promise((res, rej) => {
+      const img = new Image();
+      const u = URL.createObjectURL(blob);
+      img.onload = () => { URL.revokeObjectURL(u); res(img); };
+      img.onerror = () => { URL.revokeObjectURL(u); rej(new Error('decode')); };
+      img.src = u;
+    });
+  }
+
+  // Returns the blob, from IndexedDB if it is there and from the network if
+  // not. Network failure is entirely expected -- that is the normal state of
+  // this app -- so it resolves to null rather than throwing.
+  async function fetchTile(z, x, y, k) {
+    let blob = await DB.getTile(k).catch(() => null);
+    if (blob) return blob;
+    try {
+      const url = TILE_URL.replace('{z}', z).replace('{x}', x).replace('{y}', y);
+      const res = await fetch(url, { mode: 'cors' });
+      if (!res.ok) return null;
+      blob = await res.blob();
+      if (!blob || blob.size === 0) return null;
+      DB.putTile(k, blob).catch(() => {});
+      return blob;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function pull(z, x, y) {
+    const k = key(z, x, y);
+    if (mem.has(k) || inflight.has(k)) return;
+    const bad = failed.get(k);
+    if (bad && Date.now() - bad < RETRY_MS) return;
+    inflight.add(k);
+    try {
+      const blob = await fetchTile(z, x, y, k);
+      if (!blob) { failed.set(k, Date.now()); return; }
+      mem.set(k, await decode(blob));
+      failed.delete(k);
+      S.tilesEverSeen = true;
+      scheduleRedraw();
+    } catch (e) {
+      failed.set(k, Date.now());
+    } finally {
+      inflight.delete(k);
+    }
+  }
+
+  return {
+    // Synchronous for the draw loop: hand back what is in memory and start
+    // fetching what is not. The redraw when it lands fills in the gaps.
+    get(z, x, y) {
+      const k = key(z, x, y);
+      if (mem.has(k)) return mem.get(k);
+      pull(z, x, y);
+      return null;
+    },
+
+    // Deliberate prefetch of everything on screen, plus one zoom level in,
+    // which is what someone is actually asking for when they say "save this".
+    async saveArea(view, onProgress) {
+      const jobs = [];
+      for (let z = view.z; z <= Math.min(MAX_ZOOM, view.z + 1); z++) {
+        const s = Math.pow(2, z - view.z);
+        const n = Math.pow(2, z);
+        for (let x = Math.floor(view.x0 * s); x <= Math.floor(view.x1 * s); x++) {
+          for (let y = Math.floor(view.y0 * s); y <= Math.floor(view.y1 * s); y++) {
+            if (x < 0 || y < 0 || x >= n || y >= n) continue;
+            jobs.push([z, x, y]);
+          }
+        }
+      }
+      // A cap, because a wide view at low zoom is thousands of tiles and
+      // nobody meant to ask for that.
+      jobs.length = Math.min(jobs.length, 400);
+
+      let done = 0, ok = 0;
+      const worker = async () => {
+        while (jobs.length) {
+          const j = jobs.shift();
+          if (!j) break;
+          const k = key(j[0], j[1], j[2]);
+          const blob = await fetchTile(j[0], j[1], j[2], k);
+          if (blob) {
+            ok++;
+            if (!mem.has(k)) {
+              try { mem.set(k, await decode(blob)); } catch (e) { /* keep the bytes */ }
+            }
+          }
+          done++;
+          if (onProgress && done % 10 === 0) onProgress(done);
+        }
+      };
+      // Four at a time: enough to be quick, few enough to stay polite to a
+      // free tile server and to a phone on one bar of signal.
+      await Promise.all([worker(), worker(), worker(), worker()]);
+      scheduleRedraw();
+      return ok;
+    },
+  };
+})();
+
+// The centre the map is currently showing, falling back through what we know.
+function mapCentre() {
+  if (S.mapCentre) return S.mapCentre;
+  if (S.myPos) return S.myPos;
+  const pins = livePins();
+  if (pins.length) return { lat: pins[0].body.lat, lon: pins[0].body.lon };
+  return HOME;
+}
+
+function livePins() {
+  return byKind('pin').filter((p) =>
+    p.body && typeof p.body.lat === 'number' &&
+    !annotations(p.id, 'ack').some((a) => a.body.state === 'removed'));
+}
+
+// Everything the draw and the hit-testing both need, worked out once.
+function mapView() {
+  const cv = $('#map-canvas');
+  const w = cv.clientWidth, h = cv.clientHeight;
+  const z = S.mapZoom;
+  const c = mapCentre();
+  const cx = lonToX(c.lon, z), cy = latToY(c.lat, z);
+  return {
+    cv, w, h, z, centre: c, cx, cy,
+    // tile-space bounds of what is on screen
+    x0: cx - (w / 2) / TILE_PX, x1: cx + (w / 2) / TILE_PX,
+    y0: cy - (h / 2) / TILE_PX, y1: cy + (h / 2) / TILE_PX,
+    toPx: (lat, lon) => ({
+      x: w / 2 + (lonToX(lon, z) - cx) * TILE_PX,
+      y: h / 2 + (latToY(lat, z) - cy) * TILE_PX,
+    }),
+    toLatLon: (px, py) => ({
+      lat: yToLat(cy + (py - h / 2) / TILE_PX, z),
+      lon: xToLon(cx + (px - w / 2) / TILE_PX, z),
+    }),
+  };
+}
 
 function renderMap() {
   const cv = $('#map-canvas');
@@ -628,63 +851,62 @@ function renderMap() {
   const g = cv.getContext('2d');
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
 
+  const v = mapView();
+  const pins = livePins();
+
   g.fillStyle = '#0d1830';
   g.fillRect(0, 0, w, h);
 
-  const pins = byKind('pin').filter((p) =>
-    !annotations(p.id, 'ack').some((a) => a.body.state === 'removed'));
-
-  const centre = S.mapCentre
-    || (pins.length ? { lat: pins[0].body.lat, lon: pins[0].body.lon } : null);
-
-  if (!centre) {
-    g.fillStyle = '#94a3c4';
-    g.font = '14px system-ui, sans-serif';
-    g.textAlign = 'center';
-    g.fillText(t('no_pins'), w / 2, h / 2);
-    renderPinList(pins, null);
-    renderLegend();
-    return;
-  }
-
-  // metres per pixel, from the zoom level
-  const mpp = 0.6 * Math.pow(2, 15 - S.mapZoom);
-  const latM = 111320;
-  const lonM = 111320 * Math.cos(centre.lat * Math.PI / 180);
-
-  const project = (lat, lon) => ({
-    x: w / 2 + ((lon - centre.lon) * lonM) / mpp,
-    y: h / 2 - ((lat - centre.lat) * latM) / mpp,
-  });
-
-  // grid, 100 m per cell at the reference zoom
-  g.strokeStyle = '#1a2a4d';
-  g.lineWidth = 1;
-  const cell = 100 / mpp;
-  if (cell > 12) {
-    for (let x = (w / 2) % cell; x < w; x += cell) {
-      g.beginPath(); g.moveTo(x, 0); g.lineTo(x, h); g.stroke();
-    }
-    for (let y = (h / 2) % cell; y < h; y += cell) {
-      g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke();
+  // ------------------------------------------------------------- tiles
+  const n = Math.pow(2, v.z);
+  let drawn = 0, wanted = 0;
+  for (let tx = Math.floor(v.x0); tx <= Math.floor(v.x1); tx++) {
+    for (let ty = Math.floor(v.y0); ty <= Math.floor(v.y1); ty++) {
+      if (ty < 0 || ty >= n) continue;
+      const wrapped = ((tx % n) + n) % n;   // the world repeats east-west
+      wanted++;
+      const img = Tiles.get(v.z, wrapped, ty);
+      if (!img) continue;
+      const px = w / 2 + (tx - v.cx) * TILE_PX;
+      const py = h / 2 + (ty - v.cy) * TILE_PX;
+      try {
+        g.drawImage(img, Math.round(px), Math.round(py), TILE_PX, TILE_PX);
+        drawn++;
+      } catch (e) { /* a bitmap that failed to decode; skip it */ }
     }
   }
+  const haveMap = drawn > 0;
 
-  // the user
-  if (S.myPos) {
-    const p = project(S.myPos.lat, S.myPos.lon);
-    g.fillStyle = 'rgba(77,139,255,.22)';
-    g.beginPath(); g.arc(p.x, p.y, 22, 0, 7); g.fill();
-    g.fillStyle = '#4d8bff';
-    g.beginPath(); g.arc(p.x, p.y, 6, 0, 7); g.fill();
-    g.strokeStyle = '#fff'; g.lineWidth = 2; g.stroke();
+  // Tiles are bright and the rest of the app is dark. Knock them back so the
+  // pins stay the loudest thing on the screen, which is the point of it.
+  if (haveMap) {
+    g.fillStyle = 'rgba(11,18,32,.34)';
+    g.fillRect(0, 0, w, h);
   }
 
-  // SOS locations, drawn under the pins so a pin is never hidden
+  const mpp = metresPerPixel(v.centre.lat, v.z);
+
+  // ------------------------------------------------- fallback distance grid
+  if (!haveMap) {
+    g.strokeStyle = '#1a2a4d';
+    g.lineWidth = 1;
+    const cell = 100 / mpp;
+    if (cell > 12 && cell < 400) {
+      for (let x = (w / 2) % cell; x < w; x += cell) {
+        g.beginPath(); g.moveTo(x, 0); g.lineTo(x, h); g.stroke();
+      }
+      for (let y = (h / 2) % cell; y < h; y += cell) {
+        g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke();
+      }
+    }
+  }
+
+  // ------------------------------------------------------------ overlays
+  // SOS first, under the pins, so a pin is never hidden by an alert blob.
   for (const a of byKind('sos')) {
-    if (!a.body || !a.body.lat) continue;
+    if (!a.body || typeof a.body.lat !== 'number') continue;
     if (annotations(a.id, 'ack').some((x) => x.body.state === 'resolved')) continue;
-    const p = project(a.body.lat, a.body.lon);
+    const p = v.toPx(a.body.lat, a.body.lon);
     g.fillStyle = 'rgba(255,59,71,.28)';
     g.beginPath(); g.arc(p.x, p.y, 16, 0, 7); g.fill();
     g.fillStyle = '#ff3b47';
@@ -692,27 +914,110 @@ function renderMap() {
   }
 
   for (const pin of pins) {
-    if (!pin.body || typeof pin.body.lat !== 'number') continue;
-    const p = project(pin.body.lat, pin.body.lon);
+    const p = v.toPx(pin.body.lat, pin.body.lon);
+    if (p.x < -40 || p.y < -40 || p.x > w + 40 || p.y > h + 40) continue;
     g.fillStyle = PIN_KINDS[pin.body.kind] || '#94a3c4';
     g.beginPath(); g.arc(p.x, p.y, 8, 0, 7); g.fill();
     g.strokeStyle = '#0b1220'; g.lineWidth = 2; g.stroke();
-    g.fillStyle = '#e8eef9';
-    g.font = '11px system-ui, sans-serif';
-    g.textAlign = 'center';
-    g.fillText((pin.body.name || '').slice(0, 16), p.x, p.y - 13);
+    const label = (pin.body.name || '').slice(0, 16);
+    if (label) {
+      g.font = '11px system-ui, sans-serif';
+      g.textAlign = 'center';
+      // A dark plate behind the text: white on a pale map tile is unreadable.
+      const tw = g.measureText(label).width;
+      g.fillStyle = 'rgba(11,18,32,.72)';
+      g.fillRect(p.x - tw / 2 - 3, p.y - 24, tw + 6, 14);
+      g.fillStyle = '#e8eef9';
+      g.fillText(label, p.x, p.y - 13);
+    }
   }
 
-  // scale bar, so "how far is that" has an answer
-  const barM = 100 * Math.max(1, Math.round((w / 4 * mpp) / 100));
+  if (S.myPos) {
+    const p = v.toPx(S.myPos.lat, S.myPos.lon);
+    g.fillStyle = 'rgba(77,139,255,.22)';
+    g.beginPath(); g.arc(p.x, p.y, 22, 0, 7); g.fill();
+    g.fillStyle = '#4d8bff';
+    g.beginPath(); g.arc(p.x, p.y, 6, 0, 7); g.fill();
+    g.strokeStyle = '#fff'; g.lineWidth = 2; g.stroke();
+  }
+
+  // The spot a tap chose, before it becomes a pin.
+  if (S.pendingPin) {
+    const p = v.toPx(S.pendingPin.lat, S.pendingPin.lon);
+    g.strokeStyle = '#facc15'; g.lineWidth = 2;
+    g.beginPath(); g.arc(p.x, p.y, 11, 0, 7); g.stroke();
+    g.beginPath();
+    g.moveTo(p.x - 17, p.y); g.lineTo(p.x - 5, p.y);
+    g.moveTo(p.x + 5, p.y); g.lineTo(p.x + 17, p.y);
+    g.moveTo(p.x, p.y - 17); g.lineTo(p.x, p.y - 5);
+    g.moveTo(p.x, p.y + 5); g.lineTo(p.x, p.y + 17);
+    g.stroke();
+  }
+
+  // ------------------------------------------------------------ furniture
+  // Kept clear of the button row along the bottom edge.
+  const BASE = h - 58;
+
+  // Scale bar, so "how far is that" has an answer.
+  const rough = (w / 4) * mpp;
+  const step = Math.pow(10, Math.floor(Math.log(rough) / Math.LN10));
+  const barM = Math.max(step, Math.round(rough / step) * step);
   const barPx = barM / mpp;
   g.strokeStyle = '#e8eef9'; g.lineWidth = 2;
-  g.beginPath(); g.moveTo(14, h - 18); g.lineTo(14 + barPx, h - 18); g.stroke();
-  g.fillStyle = '#e8eef9'; g.textAlign = 'left'; g.font = '11px system-ui, sans-serif';
-  g.fillText(barM >= 1000 ? num(barM / 1000) + ' km' : num(barM) + ' m', 14, h - 24);
+  g.beginPath(); g.moveTo(14, BASE); g.lineTo(14 + barPx, BASE); g.stroke();
+  g.fillStyle = '#e8eef9'; g.textAlign = 'left';
+  g.font = '11px system-ui, sans-serif';
+  g.fillText(distance(barM), 14, BASE - 6);
 
-  renderPinList(pins, centre);
+  if (haveMap) {
+    // Required by the tile licence, and it tells a reader where the map came
+    // from, which matters when the map is the thing being trusted.
+    g.font = '10px system-ui, sans-serif';
+    g.textAlign = 'right';
+    g.fillStyle = 'rgba(232,238,249,.8)';
+    g.fillText('© OpenStreetMap', w - 8, BASE);
+  }
+
+  const note = $('#map-note');
+  if (!haveMap && wanted > 0) {
+    note.textContent = t('map_sketch');
+    note.classList.remove('hidden');
+  } else if (haveMap && drawn < wanted && !navigator.onLine) {
+    note.textContent = t('map_saved_only');
+    note.classList.remove('hidden');
+  } else {
+    // Clear as well as hide: a hidden element that still holds last
+    // language's sentence is text a screen reader can still reach.
+    note.textContent = '';
+    note.classList.add('hidden');
+  }
+
+  renderPinList(pins, v.centre);
   renderLegend();
+}
+
+function setZoom(z, anchor) {
+  const next = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
+  if (next === S.mapZoom) return;
+  // Zoom about a point rather than the middle, so pinching keeps whatever
+  // was under the fingers under the fingers.
+  if (anchor) {
+    const before = mapView();
+    const at = before.toLatLon(anchor.x, anchor.y);
+    S.mapZoom = next;
+    // Still the old centre, so this is where the anchored point drifted to.
+    const after = mapView();
+    const now = after.toPx(at.lat, at.lon);
+    // Move the centre towards that drift, not away from it: the new centre is
+    // the point currently sitting one drift-vector from the middle.
+    S.mapCentre = after.toLatLon(
+      after.w / 2 + (now.x - anchor.x),
+      after.h / 2 + (now.y - anchor.y));
+  } else {
+    S.mapCentre = mapCentre();
+    S.mapZoom = next;
+  }
+  renderMap();
 }
 
 function renderLegend() {
@@ -759,14 +1064,19 @@ function renderPinList(pins, centre) {
     info.appendChild(el('div', '', p.body.name || t('pin_' + p.body.kind)));
     const sub = el('div', 'muted tiny');
     let txt = t('pin_' + p.body.kind);
-    if (from) {
-      const d = distanceM(from, p.body);
-      txt += ' · ' + (d > 1000 ? num((d / 1000).toFixed(1)) + ' km' : num(Math.round(d)) + ' m');
-    }
+    if (from) txt += ' · ' + distance(distanceM(from, p.body));
     if (p.body.detail) txt += ' · ' + p.body.detail;
     sub.textContent = txt;
     info.appendChild(sub);
     row.appendChild(info);
+    // Tapping a place in the list centres the map on it. Reading a distance
+    // and then having to find the dot by hand is the sort of thing that only
+    // seems fine when you already know where everything is.
+    row.onclick = () => {
+      S.mapCentre = { lat: p.body.lat, lon: p.body.lon };
+      renderMap();
+      $('#map-canvas').scrollIntoView({ block: 'nearest' });
+    };
     list.appendChild(row);
   }
 }
@@ -788,7 +1098,7 @@ function renderMesh() {
     nc.appendChild(el('h3', '', S.node.name + '  ·  ' + S.node.node));
     kv(t('records'), num(S.storeStats.records || 0));
     const used = S.storeStats.bytes || 0, cap = S.storeStats.max_bytes || 1;
-    kv(t('storage'), `${num((used / 1024).toFixed(0))} KB / ${num((cap / 1048576).toFixed(1))} MB`);
+    kv(t('storage'), bytesShort(used) + ' / ' + bytesShort(cap));
     const bar = el('div', 'bar');
     const fill = el('i');
     fill.style.width = Math.min(100, (used / cap) * 100) + '%';
@@ -835,8 +1145,12 @@ function renderMesh() {
   ic.appendChild(el('small', 'muted', t('fp_note')));
   ic.appendChild(el('div', 'fp mt', S.identity.fp));
 
+  // The version comes from the node rather than a literal in this file, so a
+  // phone cannot claim to be a build it is not.
+  const ver = (S.node && S.node.version) || t('unknown');
   $('#build-info').textContent =
-    `PigeonMesh 1.0.0 · ${num(S.records.size)} ${t('records')} · ${t('carried_in')} ${num(S.carriedThisSession)}`;
+    `PigeonMesh · ${t('version')} ${num(ver)} · ${num(S.records.size)} ${t('records')}` +
+    ` · ${t('carried_in')} ${num(S.carriedThisSession)}`;
 }
 
 /* ------------------------------------------------------------------- i18n */
@@ -844,7 +1158,18 @@ function renderMesh() {
 function applyStrings() {
   $$('[data-t]').forEach((e) => { e.textContent = t(e.dataset.t); });
   $$('[data-tp]').forEach((e) => { e.placeholder = t(e.dataset.tp); });
+  $$('[data-ta]').forEach((e) => { e.setAttribute('aria-label', t(e.dataset.ta)); });
   $('#chat-input').placeholder = t('type_message');
+
+  // The switch names where it goes, not where you are. "বাং/EN" was the one
+  // place in the app that always showed both scripts at once.
+  const other = Object.keys(I18N).find((c) => c !== LANG);
+  const toggle = $('#lang-toggle');
+  if (other) {
+    toggle.textContent = I18N[other]._name;
+    toggle.dataset.to = other;
+  }
+
   buildLangRows();
   buildNeedChips();
   $('#map-legend').innerHTML = '';
@@ -885,10 +1210,145 @@ function showView(v) {
   if (v === 'map') setTimeout(renderMap, 30);
 }
 
+/* -------------------------------------------------------------- map input
+ *
+ * One pointer drags, two pinch, and a tap that did not turn into a drag
+ * chooses a spot. The tap has to survive a shaking hand, so the threshold is
+ * generous; a drag of a few pixels is still a tap.
+ */
+
+function wireMapGestures() {
+  const cv = $('#map-canvas');
+  const pts = new Map();       // pointerId -> {x, y}
+  let last = null;             // last position of the dragging pointer
+  let startAt = 0, moved = 0;
+  let pinchBase = 0;           // finger distance when the current step began
+  let lastTap = 0;
+
+  const local = (e) => {
+    const r = cv.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  };
+  const spread = () => {
+    const [a, b] = Array.from(pts.values());
+    return Math.hypot(a.x - b.x, a.y - b.y);
+  };
+  const middle = () => {
+    const [a, b] = Array.from(pts.values());
+    return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  };
+
+  function panBy(dx, dy) {
+    const v = mapView();
+    S.mapCentre = v.toLatLon(v.w / 2 - dx, v.h / 2 - dy);
+    renderMap();
+  }
+
+  cv.addEventListener('pointerdown', (e) => {
+    cv.setPointerCapture(e.pointerId);
+    pts.set(e.pointerId, local(e));
+    if (pts.size === 1) {
+      last = local(e);
+      startAt = performance.now();
+      moved = 0;
+    } else if (pts.size === 2) {
+      pinchBase = spread();
+    }
+  });
+
+  cv.addEventListener('pointermove', (e) => {
+    if (!pts.has(e.pointerId)) return;
+    const p = local(e);
+    pts.set(e.pointerId, p);
+
+    if (pts.size >= 2) {
+      // Integer zoom levels, so step when the fingers have travelled far
+      // enough to mean it and re-baseline from there.
+      const now = spread();
+      if (pinchBase > 0) {
+        const ratio = now / pinchBase;
+        if (ratio > 1.6) { setZoom(S.mapZoom + 1, middle()); pinchBase = now; }
+        else if (ratio < 0.625) { setZoom(S.mapZoom - 1, middle()); pinchBase = now; }
+      }
+      return;
+    }
+
+    if (!last) return;
+    const dx = p.x - last.x, dy = p.y - last.y;
+    moved += Math.hypot(dx, dy);
+    last = p;
+    if (moved > 3) panBy(dx, dy);
+  });
+
+  function release(e) {
+    if (!pts.has(e.pointerId)) return;
+    const p = pts.get(e.pointerId);
+    pts.delete(e.pointerId);
+    if (pts.size === 1) { last = Array.from(pts.values())[0]; moved = 999; }
+    if (pts.size > 0) return;
+
+    const quick = performance.now() - startAt < 500;
+    if (moved <= 8 && quick) {
+      const now = performance.now();
+      if (now - lastTap < 300) {
+        lastTap = 0;
+        setZoom(S.mapZoom + 1, p);
+        return;
+      }
+      lastTap = now;
+      const v = mapView();
+      S.pendingPin = v.toLatLon(p.x, p.y);
+      buzz(20);
+      renderMap();
+      toast(t('selected_spot') + ' · ' + t('add_pin'));
+    }
+    last = null;
+  }
+
+  cv.addEventListener('pointerup', release);
+  cv.addEventListener('pointercancel', release);
+
+  // Desktop and anything with a scroll wheel.
+  cv.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    setZoom(S.mapZoom + (e.deltaY < 0 ? 1 : -1), local(e));
+  }, { passive: false });
+}
+
+async function saveMapArea() {
+  const btn = $('#map-save');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  const label = btn.textContent;
+  btn.textContent = t('saving_area');
+  toast(t('saving_area'));
+  try {
+    const got = await Tiles.saveArea(mapView(), (done) => {
+      btn.textContent = t('saving_area') + ' ' + num(done);
+    });
+    toast(got > 0 ? t('area_saved') + ' · ' + num(got) : t('area_failed'),
+          got > 0 ? '' : 'sos');
+  } catch (e) {
+    toast(t('area_failed'), 'sos');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+    renderMap();
+  }
+}
+
 /* ------------------------------------------------------------- geolocation */
 
 function locate(cb) {
-  if (!navigator.geolocation) { toast(t('no_gps')); return; }
+  // Browsers refuse geolocation outside a secure context, and a mesh node on
+  // plain http is exactly that. Saying "location unavailable" sends people
+  // looking for a GPS problem they do not have, so name the real reason and
+  // point at the way round it.
+  if (!navigator.geolocation) { toast(t('no_gps'), 'sos'); return; }
+  if (window.isSecureContext === false) {
+    toast(t('gps_insecure'), 'sos');
+    return;
+  }
   toast(t('locating'));
   navigator.geolocation.getCurrentPosition(
     (pos) => {
@@ -897,7 +1357,7 @@ function locate(cb) {
       if (cb) cb(S.myPos);
       render();
     },
-    () => toast(t('no_gps')),
+    (err) => toast(err && err.code === 1 ? t('gps_insecure') : t('no_gps'), 'sos'),
     { enableHighAccuracy: true, timeout: 12000, maximumAge: 60000 });
 }
 
@@ -1068,7 +1528,8 @@ function wireEvents() {
     if (b) showView(b.dataset.view);
   });
 
-  $('#lang-toggle').onclick = () => setLang(LANG === 'bn' ? 'en' : 'bn');
+  $('#lang-toggle').onclick = (e) =>
+    setLang(e.currentTarget.dataset.to || (LANG === 'bn' ? 'en' : 'bn'));
   document.addEventListener('pm:lang', applyStrings);
 
   $('#chat-form').addEventListener('submit', (e) => {
@@ -1121,18 +1582,10 @@ function wireEvents() {
 
   $('#map-locate').onclick = () => locate((p) => { S.mapCentre = p; renderMap(); });
   $('#map-add').onclick = openPinSheet;
-
-  const cv = $('#map-canvas');
-  cv.addEventListener('pointerdown', (e) => {
-    if (!S.mapCentre) return;
-    const r = cv.getBoundingClientRect();
-    const mpp = 0.6 * Math.pow(2, 15 - S.mapZoom);
-    const lonM = 111320 * Math.cos(S.mapCentre.lat * Math.PI / 180);
-    S.pendingPin = {
-      lat: S.mapCentre.lat - ((e.clientY - r.top - r.height / 2) * mpp) / 111320,
-      lon: S.mapCentre.lon + ((e.clientX - r.left - r.width / 2) * mpp) / lonM,
-    };
-  });
+  $('#map-in').onclick = () => setZoom(S.mapZoom + 1);
+  $('#map-out').onclick = () => setZoom(S.mapZoom - 1);
+  $('#map-save').onclick = saveMapArea;
+  wireMapGestures();
 
   $('#carry-toggle').checked = S.carry;
   $('#carry-toggle').onchange = (e) => {
@@ -1213,7 +1666,10 @@ function openPinSheet() {
   cancel.onclick = () => sheet.classList.add('hidden');
   const save = el('button', 'btn btn-primary', t('save'));
   save.onclick = async () => {
-    const at = S.pendingPin || S.myPos;
+    // A tap, a GPS fix, or a map the person deliberately dragged somewhere.
+    // Never the default opening view: a pin dropped on a city someone has
+    // never been to is worse than no pin.
+    const at = S.pendingPin || S.myPos || S.mapCentre;
     if (!at) { toast(t('tap_map')); return; }
     await publish('pin', {
       kind,

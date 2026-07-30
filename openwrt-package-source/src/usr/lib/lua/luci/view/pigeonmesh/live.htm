@@ -1,0 +1,43 @@
+<%#
+ The real app, embedded. Same page a phone on the LAN gets.
+
+ The scheme is hardcoded to http, not taken from location.protocol: the daemon
+ has no TLS, so an https URL here could never load. When LuCI itself is on
+ https the browser blocks the frame as mixed content regardless of what we
+ put in src, so in that case link out instead of showing an empty box.
+-%>
+<%
+local uci = luci.model.uci.cursor()
+local port = uci:get("pigeonmesh", "main", "http_port") or "3607"
+local domain = uci:get("pigeonmesh", "main", "domain") or "pigeon.mesh"
+%>
+<%+header%>
+<h2>PigeonMesh — Live</h2>
+<div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:0.75rem;margin-bottom:1rem;font-size:0.85em;color:#075985">
+<strong>The full app</strong> — chat, SOS, missing persons, safe check-ins.
+Phones on this network reach it at <code>http://<%=domain%>/</code>.
+</div>
+<div id="pm-live-note" style="display:none;background:#fef3c7;border:1px solid #fde68a;border-radius:8px;padding:0.75rem;margin-bottom:1rem;font-size:0.9em;color:#92400e"></div>
+<iframe id="pm-live" style="width:100%;height:75vh;border:1px solid #334155;border-radius:8px;background:#0b1220"></iframe>
+<script>
+(function(){
+    var host = location.hostname;
+    if (host.indexOf(':') >= 0 && host.charAt(0) !== '[') host = '[' + host + ']';
+    var url = 'http://' + host + ':<%=port%>/';
+    var frame = document.getElementById('pm-live');
+    var note = document.getElementById('pm-live-note');
+
+    if (location.protocol === 'https:') {
+        frame.style.display = 'none';
+        note.style.display = 'block';
+        note.innerHTML =
+            '<strong>Cannot embed here.</strong> This page is loaded over HTTPS and the app ' +
+            'serves plain HTTP, so the browser blocks the frame. ' +
+            'Open <a href="' + url + '">' + url + '</a> in a new tab, ' +
+            'or reach LuCI over http to see it inline.';
+        return;
+    }
+    frame.src = url;
+})();
+</script>
+<%+footer%>

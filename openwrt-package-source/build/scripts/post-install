@@ -1,0 +1,14 @@
+#!/bin/sh
+# Runs on the router after the package files are in place.
+[ -n "$IPKG_INSTROOT" ] && exit 0
+
+mkdir -p /var/lib/pigeonmesh /etc/pigeonmesh/store
+
+# Firewall, alias address, DNS. Idempotent, so running it on every upgrade is
+# both safe and how a changed default reaches an existing install.
+[ -x /etc/uci-defaults/99-pigeonmesh ] && sh /etc/uci-defaults/99-pigeonmesh
+
+/etc/init.d/pigeonmesh enable
+/etc/init.d/pigeonmesh restart
+
+exit 0

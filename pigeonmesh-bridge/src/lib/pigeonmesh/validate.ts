@@ -6,11 +6,17 @@ import { TS_MIN, TS_MAX, MAX_BODY } from "./config";
 
 const HEX_ID = /^[0-9a-f]+$/;
 
+/** A record that has been through validate(). exp, chan and nick are always
+ *  filled in by the time it comes back, and saying so here is what lets the
+ *  store persist them without a non-null assertion papering over the one case
+ *  where they were not. */
+export type ValidRecord = PmRecord & Required<Pick<PmRecord, "exp" | "chan" | "nick">>;
+
 /** Returns a cleaned record, or { error } explaining why it was rejected. */
 export function validate(
   raw: unknown,
   maxBody: number = MAX_BODY
-): { ok: true; rec: PmRecord } | { ok: false; error: string } {
+): { ok: true; rec: ValidRecord } | { ok: false; error: string } {
   if (typeof raw !== "object" || raw === null) return { ok: false, error: "not an object" };
   const r = raw as Record<string, unknown>;
 
@@ -29,10 +35,14 @@ export function validate(
   if (ts < TS_MIN || ts > TS_MAX) return { ok: false, error: "ts out of range" };
 
   const now = Math.floor(Date.now() / 1000);
+  // Never let a missing table entry become NaN here: exp is derived from it,
+  // and a NaN exp is a record that never expires and breaks every comparison
+  // it takes part in.
+  const kindTtl = DEFAULT_TTL[kind] ?? 24 * 3600;
   const ttl =
     typeof r.exp === "number" && r.exp > ts
-      ? Math.min(r.exp - ts, DEFAULT_TTL[kind] * 4)
-      : DEFAULT_TTL[kind];
+      ? Math.min(r.exp - ts, kindTtl * 4)
+      : kindTtl;
   const exp = typeof r.exp === "number" && r.exp > ts ? r.exp : Math.floor(ts) + ttl;
 
   const chan = sanitise(r.chan, 32) || "public";

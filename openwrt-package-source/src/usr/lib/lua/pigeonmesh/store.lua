@@ -20,11 +20,16 @@ local M = {}
 
 -- Lower number = evicted last. Chosen so that life-safety traffic survives
 -- a store that is thrashing.
+-- An ack sits at 1 because it is a state change on something more important
+-- than itself: "responding", "resolved", "found". Losing the ack while keeping
+-- its target is worse than losing both -- a resolved emergency that reads as
+-- still open sends people to an address where nobody needs them.
 M.PRIORITY = {
     sos      = 0,
     checkin  = 1,
     missing  = 1,
     bulletin = 1,
+    ack      = 1,
     pin      = 2,
     dm       = 2,
     chat     = 3,
@@ -34,13 +39,17 @@ M.PRIORITY = {
 
 -- Default lifetime per kind, in seconds. A chat message is noise after a
 -- day; a missing-person report is not.
+-- An ack has to outlive whatever it annotates, or a missing person who was
+-- found is quietly missing again a day later. 30 days matches the longest
+-- target kind rather than being tuned on its own.
 M.TTL = {
     sos      = 24 * 3600,
     checkin  = 7 * 24 * 3600,
     missing  = 30 * 24 * 3600,
     bulletin = 7 * 24 * 3600,
+    ack      = 30 * 24 * 3600,
     pin      = 30 * 24 * 3600,
-    dm       = 7 * 24 * 3600,
+    dm       = 30 * 24 * 3600,
     chat     = 3 * 24 * 3600,
     profile  = 30 * 24 * 3600,
     presence = 300,
@@ -102,7 +111,9 @@ function M.validate(rec, max_body)
         author = util.sanitise(rec.author, 64) or "",
         pk     = util.sanitise(rec.pk, 128),
         sig    = util.sanitise(rec.sig, 128),
-        prio   = M.PRIORITY[kind],
+        -- Never nil: missing_from sorts on this, and a nil there aborts the
+        -- whole reconciliation round rather than mis-ordering one record.
+        prio   = M.PRIORITY[kind] or 3,
         hops   = math.floor(tonumber(rec.hops) or 0),
         origin = util.sanitise(rec.origin, 32) or "",
     }
@@ -208,8 +219,9 @@ function Store:enforce_budget()
     local all = {}
     for _, rec in pairs(self.by_id) do all[#all + 1] = rec end
     table.sort(all, function(a, b)
-        if a.prio ~= b.prio then return a.prio > b.prio end
-        return a.ts < b.ts
+        local pa, pb = a.prio or 3, b.prio or 3
+        if pa ~= pb then return pa > pb end
+        return (a.ts or 0) < (b.ts or 0)
     end)
 
     local i = 1
@@ -368,9 +380,13 @@ function Store:missing_from(bloom, max_count, max_bytes)
     for _, rec in pairs(self.by_id) do
         if not M.bloom_contains(bloom, rec.id) then cand[#cand + 1] = rec end
     end
+    -- Defensive defaults as well as the ones set on ingest: a record loaded
+    -- from a checkpoint written by an older build carries whatever that build
+    -- put there, and one nil here would take replication down entirely.
     table.sort(cand, function(a, b)
-        if a.prio ~= b.prio then return a.prio < b.prio end
-        return a.ts > b.ts
+        local pa, pb = a.prio or 3, b.prio or 3
+        if pa ~= pb then return pa < pb end
+        return (a.ts or 0) > (b.ts or 0)
     end)
     local out, bytes = {}, 0
     for _, rec in ipairs(cand) do

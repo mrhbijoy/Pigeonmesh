@@ -8,10 +8,28 @@ config pigeonmesh 'main'
 	option peer_port '7100'
 	option disc_port '7101'
 
-	# The app and its API. uhttpd keeps port 80 and LuCI keeps working.
+	# The app and its API. uhttpd keeps port 80 on the router's own address
+	# and LuCI keeps working.
 	option http_port '3607'
 	option http_addr '0.0.0.0'
 	option docroot '/www/pigeonmesh'
+
+	# A second LAN address reserved for PigeonMesh. pigeon.mesh resolves here,
+	# and a firewall redirect sends port 80 on this address to http_port. That
+	# is what lets a person type "pigeon.mesh" and land on the app with no
+	# port number and no redirect page, while the router's own address on
+	# port 80 still opens LuCI, untouched.
+	#
+	# Filled in on install by /etc/uci-defaults/99-pigeonmesh. Blank turns the
+	# friendly URL off; nothing else changes and the app stays on http_port.
+	option alias_ip ''
+	option alias_port '80'
+
+	# Bind alias_ip:alias_port directly instead of using the redirect. Only
+	# works if uhttpd has been narrowed to specific listen addresses first --
+	# otherwise its wildcard :80 socket makes the bind fail with EADDRINUSE.
+	# Leave at 0 unless you have done that deliberately.
+	option alias_listen '0'
 
 	# Storage budget. The defaults suit a router with 8 MB of free flash;
 	# raise max_bytes on anything roomier. The hot log lives in tmpfs and

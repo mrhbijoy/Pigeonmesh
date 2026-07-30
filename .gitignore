@@ -1,10 +1,16 @@
-# Excluded folders as requested
+# Not published yet.
 pigeonmesh-apk/
 pigeonmesh-disaster-kit/
 
-# Build & binary output
+# Build output. Packages are produced by openwrt-package-source/build/build.sh
+# and attached to releases rather than committed.
 dist/
-build/
+
+# Note: there is deliberately no bare "build/" rule here.
+# openwrt-package-source/build/ holds build.sh and the maintainer scripts --
+# it is source, not output, and a blanket rule silently excluded all of it.
+
+# Embedded toolchains
 .pio/
 .pioenvs/
 .piolibdeps/
@@ -14,6 +20,8 @@ build/
 # Node / Next.js
 node_modules/
 .next/
+next-env.d.ts
+*.tsbuildinfo
 
 # Environment files
 .env
