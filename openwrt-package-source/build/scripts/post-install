@@ -10,6 +10,7 @@ mkdir -p /var/lib/pigeonmesh /etc/pigeonmesh/store
 
 /etc/init.d/pigeonmesh enable
 /etc/init.d/pigeonmesh restart
+[ -x /etc/init.d/pm-bridge-sync ] && /etc/init.d/pm-bridge-sync enable >/dev/null 2>&1 && /etc/init.d/pm-bridge-sync restart >/dev/null 2>&1 || true
 
 # Clear LuCI cache and reload uhttpd so LuCI menus appear immediately
 rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* 2>/dev/null || true
