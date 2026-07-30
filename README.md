@@ -52,8 +52,8 @@ coordinator's, not the field's.
 | [`pigeonmesh-esp32/`](pigeonmesh-esp32/) | Arduino firmware for ESP32 / NodeMCU. Float switch raises an SOS; a mesh SOS sounds a local alarm. |
 | [`install-on-router.sh`](install-on-router.sh) | Optional helper that points an installed node at a cloud bridge URL. |
 
-Build outputs land in `dist/`, which is not committed — see
-[Building](#building) below.
+
+
 
 ---
 
@@ -272,7 +272,7 @@ local buzzer.
 
 ### Bill of materials
 
-| Component | Approx. cost (₹) |
+| Component | Approx. cost (Taka) |
 |---|---|
 | ESP32 DevKit v1 (38-pin) | 350 |
 | Float switch, normally closed, marine | 120 |
