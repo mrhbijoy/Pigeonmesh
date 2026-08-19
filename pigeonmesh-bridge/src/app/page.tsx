@@ -7,6 +7,7 @@
 
 import { useEffect, useState, useRef, useCallback, useSyncExternalStore } from "react";
 import { useI18n, initLang, kindKey, LANG_NAME, type Lang, type Key } from "@/lib/pigeonmesh/i18n";
+import EmergencyContacts from "@/components/pigeonmesh/EmergencyContacts";
 
 type Tab = "feed" | "chat" | "sos" | "people" | "mesh";
 type T = (k: Key) => string;
@@ -197,7 +198,7 @@ function FeedTab({ records, t, n }: { records: PmRecord[]; t: T; n: N }) {
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center gap-1.5 overflow-x-auto pb-1 -mx-3 px-3">
+      <div className="flex items-center gap-1.5 overflow-visible pb-1 -mx-3 px-3">
         {FEED_FILTERS.map((f) => (
           <button
             key={f}
@@ -207,11 +208,17 @@ function FeedTab({ records, t, n }: { records: PmRecord[]; t: T; n: N }) {
             {f === "all" ? t("filter_all") : t(kindKey(f))}
           </button>
         ))}
+
+        {/* I am working here  */}
+
+        <EmergencyContacts/>
+
         <span className="ml-auto shrink-0 text-[10px] text-slate-600">
           {n(filtered.length)} {t("count_items")}
         </span>
       </div>
 
+      {/* showing the records */}
       {filtered.length === 0 ? (
         <EmptyState t={t} />
       ) : (

@@ -7,8 +7,12 @@
 //   PIGEONMESH_USE_PRISMA=1
 //   DATABASE_URL=postgres://...  (Vercel Postgres)
 
+
+
+
+
 import { db as memDb } from "@/lib/db-memory";
-import { db as prismaDb } from "@/lib/db-prisma";
+
 
 const usePrisma =
   process.env.PIGEONMESH_USE_PRISMA === "1" &&
@@ -19,6 +23,17 @@ const usePrisma =
 const isVercel = !!process.env.VERCEL;
 const useMemory = !usePrisma || (isVercel && process.env.PIGEONMESH_USE_PRISMA !== "1");
 
-export const db = useMemory ? memDb : prismaDb;
+
+
+// Dynamically lazily load Prisma only when called, or fallback to memDb
+export const db = useMemory
+  ? memDb
+  : (() => {
+      // Lazy load only when db is accessed
+      return require("@/lib/db-prisma").db;
+    })();
+
+
+
 
 export const isInMemory = useMemory;

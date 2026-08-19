@@ -171,7 +171,7 @@ function RecordRow({ r }: { r: PmRecord }) {
             <span className="font-mono text-[10px] text-slate-700">{r.origin}</span>
           )}
         </div>
-        <p className="mt-0.5 break-words text-slate-300">{text}</p>
+        <p className="mt-0.5 break-word text-slate-300">{text}</p>
         {geo && (
           <p className="mt-0.5 font-mono text-[10px] text-slate-500">📍 {geo}</p>
         )}
